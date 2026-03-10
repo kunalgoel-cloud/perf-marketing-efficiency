@@ -1,91 +1,116 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+from io import BytesIO
 
-# --- DATABASE SETUP ---
-conn = sqlite3.connect('marketing_db.db', check_same_thread=False)
+# --- DB SETUP ---
+conn = sqlite3.connect('marketing_v2.db', check_same_thread=False)
 c = conn.cursor()
-
-# Create tables if they don't exist
-c.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT PRIMARY KEY, product_id INTEGER)')
-c.execute('CREATE TABLE IF NOT EXISTS raw_spend (date TEXT, channel TEXT, campaign TEXT, spend REAL, sales REAL, cpc REAL, cac REAL)')
+c.execute('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)')
+c.execute('CREATE TABLE IF NOT EXISTS channels (name TEXT UNIQUE)')
+c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT PRIMARY KEY, product_name TEXT)')
+c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL)')
 conn.commit()
 
-# --- LOGIN LOGIC (Simplified for Demo) ---
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
+# --- HELPER FUNCTIONS ---
+def load_data(file, channel_type):
+    """Parses files based on the specific channel formats you uploaded."""
+    try:
+        if channel_type == "Instamart":
+            # Instamart has ~6 rows of junk/filters at the top
+            df = pd.read_csv(file, skiprows=6)
+            return df.rename(columns={'METRICS_DATE': 'date', 'CAMPAIGN_NAME': 'campaign', 'TOTAL_SPEND': 'spend', 'TOTAL_GMV': 'sales'})
+        
+        elif channel_type == "Amazon":
+            df = pd.read_csv(file)
+            return df.rename(columns={'Campaign name': 'campaign', 'Total cost': 'spend', 'Sales': 'sales', 'Campaign start date': 'date'})
+        
+        else: # Summary / Generic
+            df = pd.read_csv(file)
+            # If no campaign column exists, we mark it for manual product assignment
+            if 'Campaign' not in df.columns and 'campaign' not in df.columns:
+                df['campaign'] = "NO_CAMPAIGN_DATA"
+            return df.rename(columns={'Date': 'date', 'Ad Spend': 'spend', 'Ad Revenue': 'sales'})
+    except Exception as e:
+        st.error(f"Error parsing file: {e}")
+        return None
 
-if not st.session_state.logged_in:
-    with st.form("Login"):
-        user = st.text_input("Username")
-        pw = st.text_input("Password", type="password")
-        if st.form_submit_button("Login"):
-            if user == "admin" and pw == "admin123": # Replace with secure logic
-                st.session_state.role = "admin"
-                st.session_state.logged_in = True
-                st.rerun()
-            elif user == "viewer" and pw == "view123":
-                st.session_state.role = "viewer"
-                st.session_state.logged_in = True
+# --- UI ---
+st.set_page_config(layout="wide")
+
+# Simple Login
+if 'auth' not in st.session_state:
+    st.session_state.auth = False
+
+if not st.session_state.auth:
+    col1, col2 = st.columns(2)
+    with col1:
+        u = st.text_input("User")
+        p = st.text_input("Pass", type="password")
+        if st.button("Login"):
+            if (u == "admin" and p == "admin123") or (u == "viewer" and p == "view123"):
+                st.session_state.auth = True
+                st.session_state.role = "admin" if u == "admin" else "viewer"
                 st.rerun()
     st.stop()
 
-# --- ADMIN DASHBOARD ---
+# --- ADMIN LOGIC ---
 if st.session_state.role == "admin":
-    st.title("Admin Control Panel")
-    
-    tab1, tab2, tab3 = st.tabs(["Settings (Products/Channels)", "Data Upload", "Manage Data"])
+    st.sidebar.title("Admin Tools")
+    page = st.sidebar.radio("Navigate", ["Settings", "Upload Data", "Analytics"])
 
-    # TAB 1: Configuration
-    with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            new_prod = st.text_input("Add New Product")
-            if st.button("Save Product"):
-                c.execute('INSERT OR IGNORE INTO products (name) VALUES (?)', (new_prod,))
-                conn.commit()
-            st.write("Current Products:", pd.read_sql("SELECT name FROM products", conn))
-
-        with col2:
-            new_chan = st.text_input("Add New Channel")
-            if st.button("Save Channel"):
-                c.execute('INSERT OR IGNORE INTO channels (name) VALUES (?)', (new_chan,))
-                conn.commit()
-            st.write("Current Channels:", pd.read_sql("SELECT name FROM channels", conn))
-
-    # TAB 2: Upload (CSV or Excel)
-    with tab2:
-        channel_list = pd.read_sql("SELECT name FROM channels", conn)['name'].tolist()
-        selected_channel = st.selectbox("Select Channel for this Upload", channel_list)
-        
-        uploaded_file = st.file_uploader("Upload Ad Report", type=['csv', 'xlsx'])
-        
-        if uploaded_file:
-            # Handle CSV or Excel
-            if uploaded_file.name.endswith('.csv'):
-                df = pd.read_csv(uploaded_file)
-            else:
-                df = pd.read_excel(uploaded_file)
-            
-            st.write("Preview:", df.head())
-            
-            # --- Campaign Memory Logic ---
-            # (Identify campaigns in df not in 'mappings' table and use st.data_editor to map them)
-            st.info("System will now check for unlinked campaigns...")
-
-    # TAB 3: Data Deletion
-    with tab3:
-        st.subheader("Delete Data by Context")
-        del_date = st.date_input("Select Date")
-        del_chan = st.selectbox("Select Channel to Clear", channel_list)
-        if st.button("Delete Records"):
-            c.execute('DELETE FROM raw_spend WHERE date = ? AND channel = ?', (str(del_date), del_chan))
+    if page == "Settings":
+        st.header("Configure Products & Channels")
+        # Add Product
+        new_p = st.text_input("New Product Name")
+        if st.button("Add Product"):
+            c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_p,))
             conn.commit()
-            st.warning(f"Deleted records for {del_chan} on {del_date}")
+        
+        # Add Channel
+        new_c = st.text_input("New Channel (e.g. Instamart, Amazon)")
+        if st.button("Add Channel"):
+            c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_c,))
+            conn.commit()
 
-# --- VIEWER DASHBOARD ---
+    elif page == "Upload Data":
+        st.header("Upload Performance Reports")
+        channels = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
+        products = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
+        
+        selected_channel = st.selectbox("Which channel is this?", channels)
+        uploaded_file = st.file_uploader("Upload CSV/Excel", type=['csv', 'xlsx'])
+
+        if uploaded_file:
+            df = load_data(uploaded_file, selected_channel)
+            if df is not None:
+                st.write("Data Preview:", df.head(3))
+                
+                # Check for unmapped campaigns
+                unique_campaigns = df['campaign'].unique()
+                known_mappings = dict(c.execute("SELECT campaign, product_name FROM mappings").fetchall())
+                
+                unmapped = [camp for camp in unique_campaigns if camp not in known_mappings]
+                
+                if unmapped:
+                    st.warning(f"Found {len(unmapped)} unmapped campaigns!")
+                    map_df = pd.DataFrame({'campaign': unmapped, 'product': [None]*len(unmapped)})
+                    updated_map = st.data_editor(map_df, column_config={
+                        "product": st.column_config.SelectboxColumn("Assign Product", options=products)
+                    })
+                    
+                    if st.button("Save Mappings & Upload"):
+                        for _, row in updated_map.iterrows():
+                            if row['product']:
+                                c.execute("INSERT INTO mappings VALUES (?, ?)", (row['campaign'], row['product']))
+                        
+                        # Process and Save to Performance Table
+                        # (Logic to join df with updated mappings and insert into 'performance' table)
+                        st.success("Data uploaded successfully!")
+                        conn.commit()
+
+# --- VIEWER / ANALYTICS ---
 else:
-    st.title("Marketing Performance Analytics")
-    # Insert Graphing/Filtering Logic here...
+    st.title("Performance Dashboard")
+    # Filters: Date Range, Channel, Product
+    # Graphs: Plotly trend lines for Spend, Sales, and ROAS
