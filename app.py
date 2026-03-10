@@ -39,20 +39,16 @@ def standardize_data(df, manual_date=None):
     }
     df = df.rename(columns=mapping)
     if 'campaign' not in df.columns: df['campaign'] = "CHANNEL_TOTAL"
-    
     for col in ['spend', 'sales']:
         if col not in df.columns: df[col] = 0.0
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
-
     df = df[df['spend'] > 0].copy()
-
     if manual_date:
         df['date'] = manual_date.strftime('%Y-%m-%d')
     else:
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         df = df.dropna(subset=['date'])
         df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-    
     return df[['date', 'campaign', 'spend', 'sales']]
 
 # --- 3. AUTHENTICATION ---
@@ -68,12 +64,10 @@ if not st.session_state.auth:
 
 choice = st.sidebar.selectbox("Navigation", ["Dashboard", "Upload Reports", "Settings"] if st.session_state.role == "admin" else ["Dashboard"])
 
-# --- 4. SETTINGS ---
+# --- 4. SETTINGS (MASTER DATA & MAPPING MANAGER) ---
 if choice == "Settings":
     st.header("⚙️ System Management")
-    
     t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
-    
     with t1:
         col1, col2 = st.columns(2)
         with col1:
@@ -90,24 +84,17 @@ if choice == "Settings":
                 c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
                 conn.commit(); st.rerun()
             st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
-
     with t2:
         st.subheader("🔗 Campaign to Product Mappings")
         df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", conn)
-        
         search = st.text_input("🔍 Search Campaign Name")
-        if search:
-            df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
-        
-        # Display mappings with delete option
+        if search: df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
         for _, row in df_map.iterrows():
             m_col1, m_col2 = st.columns([3, 1])
             m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
             if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
                 c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", (row['campaign'], row['product_name']))
-                conn.commit()
-                st.rerun()
-
+                conn.commit(); st.rerun()
     with t3:
         st.subheader("🗑️ Delete Performance Records")
         d_col1, d_col2 = st.columns(2)
@@ -120,19 +107,16 @@ if choice == "Settings":
             if target_ch != "Select" and target_date:
                 d_str = target_date.strftime('%Y-%m-%d')
                 c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
-                conn.commit()
-                st.warning(f"Deleted {target_ch} for {d_str}")
+                conn.commit(); st.warning(f"Deleted {target_ch} for {d_str}")
 
 # --- 5. UPLOAD ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     u_col1, u_col2 = st.columns(2)
-    with u_col1:
-        manual_date = st.date_input("Date Override (Optional)", value=None)
+    with u_col1: manual_date = st.date_input("Date Override (Optional)", value=None)
     with u_col2:
         chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
         sel_ch = st.selectbox("Assign Channel", chs)
-    
     file = st.file_uploader("Upload File", type=['csv', 'xlsx'])
     if file:
         raw_df = robust_read_file(file)
@@ -141,7 +125,6 @@ elif choice == "Upload Reports":
             mappings = {}
             for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
                 mappings.setdefault(r[0], []).append(r[1])
-            
             unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
             if unmapped:
                 st.warning(f"Map {len(unmapped)} new campaigns")
@@ -149,26 +132,23 @@ elif choice == "Upload Reports":
                 with st.form("map_form"):
                     new_maps = {cp: st.multiselect(f"Map: {cp}", prods) for cp in unmapped}
                     if st.form_submit_button("Save Mappings"):
-                        for cp, p_list in new_maps.items():
-                            for p_name in p_list:
-                                c.execute("INSERT OR IGNORE INTO mappings VALUES (?,?)", (cp, p_name))
+                        for cp, pl in new_maps.items():
+                            for pn in pl: c.execute("INSERT INTO mappings VALUES (?,?)", (cp, pn))
                         conn.commit(); st.rerun()
             else:
                 if st.button("🚀 Push to Dashboard"):
                     for _, row in df.iterrows():
-                        target_prods = mappings.get(row['campaign'], ["Unmapped"])
-                        n = len(target_prods)
-                        for p_name in target_prods:
-                            c.execute("INSERT INTO performance VALUES (?,?,?,?,?,?,?,?)", 
-                                      (row['date'], sel_ch, row['campaign'], p_name, row['spend']/n, row['sales']/n, 0, 0))
+                        targets = mappings.get(row['campaign'], ["Unmapped"])
+                        n = len(targets)
+                        for p_name in targets:
+                            c.execute("INSERT INTO performance VALUES (?,?,?,?,?,?,?,?)", (row['date'], sel_ch, row['campaign'], p_name, row['spend']/n, row['sales']/n, 0, 0))
                     conn.commit(); st.success("Pushed!")
 
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
     df_p = pd.read_sql("SELECT * FROM performance", conn)
-    if df_p.empty:
-        st.info("No data.")
+    if df_p.empty: st.info("No data.")
     else:
         df_p['date'] = pd.to_datetime(df_p['date'])
         st.sidebar.subheader("Filters")
@@ -178,8 +158,7 @@ elif choice == "Dashboard":
 
         if len(dr) == 2:
             f_df = df_p[(df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
-        else:
-            f_df = df_p[(df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
+        else: f_df = df_p[(df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
 
         t_spend, t_sales = f_df['spend'].sum(), f_df['sales'].sum()
         roas = t_sales / t_spend if t_spend > 0 else 0
@@ -188,7 +167,16 @@ elif choice == "Dashboard":
         k2.metric("Revenue", f"₹{t_sales:,.0f}")
         k3.metric("ROAS", f"{roas:.2f}x")
 
-        # Tables
+        # RESTORED TREND CHART
+        st.subheader("Efficiency Trend")
+        trend = f_df.groupby('date').agg({'spend':'sum', 'sales':'sum'}).reset_index().sort_values('date')
+        trend['ROAS'] = trend['sales'] / trend['spend']
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=trend['date'], y=trend['spend'], name="Spend", marker_color='#3498db'))
+        fig.add_trace(go.Scatter(x=trend['date'], y=trend['ROAS'], name="ROAS", yaxis="y2", line=dict(color='#e74c3c', width=3)))
+        fig.update_layout(yaxis=dict(title="Spend (₹)"), yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, trend['ROAS'].max()*1.2 if not trend.empty else 10]), legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig, use_container_width=True)
+
         st.divider()
         c1, c2 = st.columns(2)
         with c1:
@@ -197,7 +185,6 @@ elif choice == "Dashboard":
         with c2:
             st.write("**By Product**")
             st.dataframe(f_df.groupby('product').agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
-
         st.write("**Campaign Performance**")
         cp_tab = f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
         st.dataframe(cp_tab.sort_values('spend', ascending=False).style.format({'spend':'₹{:.2f}', 'sales':'₹{:.2f}', 'ROAS':'{:.2f}x'}), use_container_width=True, hide_index=True)
