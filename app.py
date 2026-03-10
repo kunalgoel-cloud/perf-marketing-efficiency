@@ -14,7 +14,7 @@ c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT, product_name TEXT
 c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL, clicks REAL, orders REAL)')
 conn.commit()
 
-# --- 2. ROBUST DATA PARSING ---
+# --- 2. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
     file_name = file.name.lower()
     if file_name.endswith(('.xlsx', '.xls')):
@@ -64,7 +64,7 @@ if not st.session_state.auth:
 
 choice = st.sidebar.selectbox("Navigation", ["Dashboard", "Upload Reports", "Settings"] if st.session_state.role == "admin" else ["Dashboard"])
 
-# --- 4. SETTINGS (MASTER DATA & MAPPING MANAGER) ---
+# --- 4. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
     t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
@@ -85,9 +85,9 @@ if choice == "Settings":
                 conn.commit(); st.rerun()
             st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
     with t2:
-        st.subheader("🔗 Campaign to Product Mappings")
+        st.subheader("🔗 Mapping Manager")
         df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", conn)
-        search = st.text_input("🔍 Search Campaign Name")
+        search = st.text_input("🔍 Search Campaign")
         if search: df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
         for _, row in df_map.iterrows():
             m_col1, m_col2 = st.columns([3, 1])
@@ -96,18 +96,18 @@ if choice == "Settings":
                 c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", (row['campaign'], row['product_name']))
                 conn.commit(); st.rerun()
     with t3:
-        st.subheader("🗑️ Delete Performance Records")
+        st.subheader("🗑️ Delete Data")
         d_col1, d_col2 = st.columns(2)
         with d_col1:
             chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
-            target_ch = st.selectbox("Select Channel", ["Select"] + chs)
+            target_ch = st.selectbox("Channel", ["Select"] + chs)
         with d_col2:
-            target_date = st.date_input("Select Date", value=None)
+            target_date = st.date_input("Date", value=None)
         if st.button("Delete Records", type="primary"):
             if target_ch != "Select" and target_date:
                 d_str = target_date.strftime('%Y-%m-%d')
                 c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
-                conn.commit(); st.warning(f"Deleted {target_ch} for {d_str}")
+                conn.commit(); st.warning(f"Cleared {target_ch} for {d_str}")
 
 # --- 5. UPLOAD ---
 elif choice == "Upload Reports":
@@ -167,14 +167,38 @@ elif choice == "Dashboard":
         k2.metric("Revenue", f"₹{t_sales:,.0f}")
         k3.metric("ROAS", f"{roas:.2f}x")
 
-        # RESTORED TREND CHART
-        st.subheader("Efficiency Trend")
-        trend = f_df.groupby('date').agg({'spend':'sum', 'sales':'sum'}).reset_index().sort_values('date')
-        trend['ROAS'] = trend['sales'] / trend['spend']
+        # --- MULTI-CHANNEL TREND CHART ---
+        st.subheader("Efficiency Trend by Channel")
+        
+        # Aggregate data for charting
+        ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
+        ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
+        total_trend = f_df.groupby('date').agg({'spend':'sum', 'sales':'sum'}).reset_index()
+        total_trend['ROAS'] = total_trend['sales'] / total_trend['spend']
+
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=trend['date'], y=trend['spend'], name="Spend", marker_color='#3498db'))
-        fig.add_trace(go.Scatter(x=trend['date'], y=trend['ROAS'], name="ROAS", yaxis="y2", line=dict(color='#e74c3c', width=3)))
-        fig.update_layout(yaxis=dict(title="Spend (₹)"), yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, trend['ROAS'].max()*1.2 if not trend.empty else 10]), legend=dict(orientation="h", y=1.1))
+        
+        # 1. Stacked Bars for Spend per Channel
+        for channel in ch_trend['channel'].unique():
+            ch_data = ch_trend[ch_trend['channel'] == channel]
+            fig.add_trace(go.Bar(x=ch_data['date'], y=ch_data['spend'], name=f"{channel} Spend"))
+            
+        # 2. Individual Lines for ROAS per Channel
+        for channel in ch_trend['channel'].unique():
+            ch_data = ch_trend[ch_trend['channel'] == channel]
+            fig.add_trace(go.Scatter(x=ch_data['date'], y=ch_data['ROAS'], name=f"{channel} ROAS", yaxis="y2", mode='lines+markers'))
+
+        # 3. Total ROAS Line (Dashed)
+        fig.add_trace(go.Scatter(x=total_trend['date'], y=total_trend['ROAS'], name="Total ROAS", 
+                                 yaxis="y2", line=dict(color='black', width=4, dash='dot')))
+
+        fig.update_layout(
+            barmode='stack',
+            yaxis=dict(title="Spend (₹)"),
+            yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]),
+            legend=dict(orientation="h", y=1.2),
+            hovermode="x unified"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
@@ -185,6 +209,7 @@ elif choice == "Dashboard":
         with c2:
             st.write("**By Product**")
             st.dataframe(f_df.groupby('product').agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
+        
         st.write("**Campaign Performance**")
         cp_tab = f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
         st.dataframe(cp_tab.sort_values('spend', ascending=False).style.format({'spend':'₹{:.2f}', 'sales':'₹{:.2f}', 'ROAS':'{:.2f}x'}), use_container_width=True, hide_index=True)
