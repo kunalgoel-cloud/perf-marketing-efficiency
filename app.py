@@ -1,56 +1,91 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
 
-# --- MOCK DATABASE (In a real app, use SQLite or PostgreSQL) ---
-if 'mapping_db' not in st.session_state:
-    # Campaign Name -> Product Name
-    st.session_state.mapping_db = pd.DataFrame(columns=['Campaign', 'Product'])
+# --- DATABASE SETUP ---
+conn = sqlite3.connect('marketing_db.db', check_same_thread=False)
+c = conn.cursor()
 
-if 'products' not in st.session_state:
-    st.session_state.products = ['Product A', 'Product B', 'Brand/Global']
+# Create tables if they don't exist
+c.execute('CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
+c.execute('CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
+c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT PRIMARY KEY, product_id INTEGER)')
+c.execute('CREATE TABLE IF NOT EXISTS raw_spend (date TEXT, channel TEXT, campaign TEXT, spend REAL, sales REAL, cpc REAL, cac REAL)')
+conn.commit()
 
-def save_mapping(new_mappings):
-    st.session_state.mapping_db = pd.concat([st.session_state.mapping_db, new_mappings]).drop_duplicates('Campaign')
+# --- LOGIN LOGIC (Simplified for Demo) ---
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
 
-# --- ADMIN PAGE UI ---
-st.title("Admin: Ad Report Upload")
+if not st.session_state.logged_in:
+    with st.form("Login"):
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
+        if st.form_submit_button("Login"):
+            if user == "admin" and pw == "admin123": # Replace with secure logic
+                st.session_state.role = "admin"
+                st.session_state.logged_in = True
+                st.rerun()
+            elif user == "viewer" and pw == "view123":
+                st.session_state.role = "viewer"
+                st.session_state.logged_in = True
+                st.rerun()
+    st.stop()
 
-uploaded_file = st.file_uploader("Upload Channel Report (CSV)", type="csv")
-
-if uploaded_file:
-    # 1. Load the raw data
-    raw_df = pd.read_csv(uploaded_file)
-    st.write("### Raw Data Preview", raw_df.head())
+# --- ADMIN DASHBOARD ---
+if st.session_state.role == "admin":
+    st.title("Admin Control Panel")
     
-    # 2. Identify Campaigns not in our "Memory"
-    existing_campaigns = st.session_state.mapping_db['Campaign'].tolist()
-    uploaded_campaigns = raw_df['Campaign Name'].unique()
-    
-    new_campaigns = [c for c in uploaded_campaigns if c not in existing_campaigns]
-    
-    if new_campaigns:
-        st.warning(f"Found {len(new_campaigns)} new campaigns. Please map them to products.")
+    tab1, tab2, tab3 = st.tabs(["Settings (Products/Channels)", "Data Upload", "Manage Data"])
+
+    # TAB 1: Configuration
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            new_prod = st.text_input("Add New Product")
+            if st.button("Save Product"):
+                c.execute('INSERT OR IGNORE INTO products (name) VALUES (?)', (new_prod,))
+                conn.commit()
+            st.write("Current Products:", pd.read_sql("SELECT name FROM products", conn))
+
+        with col2:
+            new_chan = st.text_input("Add New Channel")
+            if st.button("Save Channel"):
+                c.execute('INSERT OR IGNORE INTO channels (name) VALUES (?)', (new_chan,))
+                conn.commit()
+            st.write("Current Channels:", pd.read_sql("SELECT name FROM channels", conn))
+
+    # TAB 2: Upload (CSV or Excel)
+    with tab2:
+        channel_list = pd.read_sql("SELECT name FROM channels", conn)['name'].tolist()
+        selected_channel = st.selectbox("Select Channel for this Upload", channel_list)
         
-        # Create a temporary dataframe for the Admin to fill out
-        to_map_df = pd.DataFrame({'Campaign': new_campaigns, 'Product': None})
+        uploaded_file = st.file_uploader("Upload Ad Report", type=['csv', 'xlsx'])
         
-        # 3. The "Memory" Editor
-        # This allows the admin to select the product from a dropdown
-        updated_mapping = st.data_editor(
-            to_map_df,
-            column_config={
-                "Product": st.column_config.SelectboxColumn(
-                    "Assign Product",
-                    options=st.session_state.products,
-                    required=True,
-                )
-            },
-            hide_index=True,
-        )
-        
-        if st.button("Save Mappings & Process Report"):
-            save_mapping(updated_mapping)
-            st.success("Mappings updated! System will now remember these for next time.")
-            # Proceed to calculate product-level spend...
-    else:
-        st.info("All campaigns recognized. Processing data...")
+        if uploaded_file:
+            # Handle CSV or Excel
+            if uploaded_file.name.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                df = pd.read_excel(uploaded_file)
+            
+            st.write("Preview:", df.head())
+            
+            # --- Campaign Memory Logic ---
+            # (Identify campaigns in df not in 'mappings' table and use st.data_editor to map them)
+            st.info("System will now check for unlinked campaigns...")
+
+    # TAB 3: Data Deletion
+    with tab3:
+        st.subheader("Delete Data by Context")
+        del_date = st.date_input("Select Date")
+        del_chan = st.selectbox("Select Channel to Clear", channel_list)
+        if st.button("Delete Records"):
+            c.execute('DELETE FROM raw_spend WHERE date = ? AND channel = ?', (str(del_date), del_chan))
+            conn.commit()
+            st.warning(f"Deleted records for {del_chan} on {del_date}")
+
+# --- VIEWER DASHBOARD ---
+else:
+    st.title("Marketing Performance Analytics")
+    # Insert Graphing/Filtering Logic here...
