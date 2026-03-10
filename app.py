@@ -38,19 +38,14 @@ def standardize_data(df, manual_date=None):
         'Date': 'date', 'Ad Spend': 'spend', 'Ad Revenue': 'sales'
     }
     df = df.rename(columns=mapping)
+    if 'campaign' not in df.columns: df['campaign'] = "CHANNEL_TOTAL"
     
-    # NEW: Fix for KeyError 'campaign'
-    if 'campaign' not in df.columns:
-        df['campaign'] = "CHANNEL_TOTAL"
-    
-    # Numeric Cleanup
     for col in ['spend', 'sales']:
         if col not in df.columns: df[col] = 0.0
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
 
     df = df[df['spend'] > 0].copy()
 
-    # Date Logic
     if manual_date:
         df['date'] = manual_date.strftime('%Y-%m-%d')
     else:
@@ -76,36 +71,57 @@ choice = st.sidebar.selectbox("Navigation", ["Dashboard", "Upload Reports", "Set
 # --- 4. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Channels")
-        new_ch = st.text_input("Add Channel")
-        if st.button("Save Channel"): 
-            c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
-            conn.commit()
-        st.dataframe(pd.read_sql("SELECT name FROM channels", conn), hide_index=True)
-    with col2:
-        st.subheader("Products")
-        new_pr = st.text_input("Add Product")
-        if st.button("Save Product"): 
-            c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
-            conn.commit()
-        st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
+    
+    t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
+    
+    with t1:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Channels")
+            new_ch = st.text_input("Add Channel")
+            if st.button("Save Channel"): 
+                c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
+                conn.commit(); st.rerun()
+            st.dataframe(pd.read_sql("SELECT name FROM channels", conn), hide_index=True)
+        with col2:
+            st.subheader("Products")
+            new_pr = st.text_input("Add Product")
+            if st.button("Save Product"): 
+                c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
+                conn.commit(); st.rerun()
+            st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
 
-    st.divider()
-    st.subheader("🗑️ Delete Records")
-    d_col1, d_col2 = st.columns(2)
-    with d_col1:
-        chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
-        target_ch = st.selectbox("Select Channel", ["Select"] + chs)
-    with d_col2:
-        target_date = st.date_input("Select Date", value=None)
-    if st.button("Delete", type="primary"):
-        if target_ch != "Select" and target_date:
-            d_str = target_date.strftime('%Y-%m-%d')
-            c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
-            conn.commit()
-            st.warning(f"Deleted {target_ch} for {d_str}")
+    with t2:
+        st.subheader("🔗 Campaign to Product Mappings")
+        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", conn)
+        
+        search = st.text_input("🔍 Search Campaign Name")
+        if search:
+            df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
+        
+        # Display mappings with delete option
+        for _, row in df_map.iterrows():
+            m_col1, m_col2 = st.columns([3, 1])
+            m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
+            if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
+                c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", (row['campaign'], row['product_name']))
+                conn.commit()
+                st.rerun()
+
+    with t3:
+        st.subheader("🗑️ Delete Performance Records")
+        d_col1, d_col2 = st.columns(2)
+        with d_col1:
+            chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
+            target_ch = st.selectbox("Select Channel", ["Select"] + chs)
+        with d_col2:
+            target_date = st.date_input("Select Date", value=None)
+        if st.button("Delete Records", type="primary"):
+            if target_ch != "Select" and target_date:
+                d_str = target_date.strftime('%Y-%m-%d')
+                c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
+                conn.commit()
+                st.warning(f"Deleted {target_ch} for {d_str}")
 
 # --- 5. UPLOAD ---
 elif choice == "Upload Reports":
@@ -122,15 +138,13 @@ elif choice == "Upload Reports":
         raw_df = robust_read_file(file)
         if raw_df is not None:
             df = standardize_data(raw_df, manual_date=manual_date)
-            
-            # Fetch mappings
             mappings = {}
             for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
                 mappings.setdefault(r[0], []).append(r[1])
             
             unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
             if unmapped:
-                st.warning(f"Map {len(unmapped)} campaigns")
+                st.warning(f"Map {len(unmapped)} new campaigns")
                 prods = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
                 with st.form("map_form"):
                     new_maps = {cp: st.multiselect(f"Map: {cp}", prods) for cp in unmapped}
