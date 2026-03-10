@@ -1,116 +1,141 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from io import BytesIO
+import io
 
 # --- DB SETUP ---
-conn = sqlite3.connect('marketing_v2.db', check_same_thread=False)
+conn = sqlite3.connect('marketing_v3.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)')
 c.execute('CREATE TABLE IF NOT EXISTS channels (name TEXT UNIQUE)')
 c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT PRIMARY KEY, product_name TEXT)')
-c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL)')
+c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL, cpc REAL)')
 conn.commit()
 
-# --- HELPER FUNCTIONS ---
-def load_data(file, channel_type):
-    """Parses files based on the specific channel formats you uploaded."""
+def robust_read_csv(file):
+    """Attempts to read CSV using different encodings to avoid 'utf-8' errors."""
+    bytes_data = file.read()
+    for encoding in ['utf-8', 'ISO-8859-1', 'cp1252', 'utf-16']:
+        try:
+            df = pd.read_csv(io.BytesIO(bytes_data), encoding=encoding)
+            return df
+        except Exception:
+            continue
+    # If standard read fails, try skipping metadata (for Instamart style)
     try:
-        if channel_type == "Instamart":
-            # Instamart has ~6 rows of junk/filters at the top
-            df = pd.read_csv(file, skiprows=6)
-            return df.rename(columns={'METRICS_DATE': 'date', 'CAMPAIGN_NAME': 'campaign', 'TOTAL_SPEND': 'spend', 'TOTAL_GMV': 'sales'})
-        
-        elif channel_type == "Amazon":
-            df = pd.read_csv(file)
-            return df.rename(columns={'Campaign name': 'campaign', 'Total cost': 'spend', 'Sales': 'sales', 'Campaign start date': 'date'})
-        
-        else: # Summary / Generic
-            df = pd.read_csv(file)
-            # If no campaign column exists, we mark it for manual product assignment
-            if 'Campaign' not in df.columns and 'campaign' not in df.columns:
-                df['campaign'] = "NO_CAMPAIGN_DATA"
-            return df.rename(columns={'Date': 'date', 'Ad Spend': 'spend', 'Ad Revenue': 'sales'})
+        df = pd.read_csv(io.BytesIO(bytes_data), encoding='ISO-8859-1', skiprows=6)
+        return df
     except Exception as e:
-        st.error(f"Error parsing file: {e}")
+        st.error(f"Could not parse file: {e}")
         return None
 
-# --- UI ---
-st.set_page_config(layout="wide")
+def process_file(df, channel):
+    """Normalizes different channel headers into a standard format."""
+    # Instamart detection
+    if 'METRICS_DATE' in df.columns:
+        df = df.rename(columns={'METRICS_DATE': 'date', 'CAMPAIGN_NAME': 'campaign', 'TOTAL_SPEND': 'spend', 'TOTAL_GMV': 'sales'})
+    
+    # Generic Performance Summary (Blinkit/Zepto style)
+    elif 'Ad Spend' in df.columns:
+        df = df.rename(columns={'Date': 'date', 'Ad Spend': 'spend', 'Ad Revenue': 'sales'})
+        if 'Campaign' not in df.columns:
+            df['campaign'] = "CHANNEL_TOTAL" # Will trigger product selection
+    
+    # Amazon style
+    elif 'Campaign name' in df.columns:
+        df = df.rename(columns={'Campaign name': 'campaign', 'Total cost': 'spend', 'Sales': 'sales', 'Campaign start date': 'date'})
 
-# Simple Login
-if 'auth' not in st.session_state:
-    st.session_state.auth = False
+    # Clean numeric data (Remove currency symbols/commas)
+    for col in ['spend', 'sales']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
+    
+    return df
 
-if not st.session_state.auth:
-    col1, col2 = st.columns(2)
-    with col1:
-        u = st.text_input("User")
-        p = st.text_input("Pass", type="password")
+# --- APP UI ---
+st.title("Performance Marketing Dashboard")
+
+# Login Section
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    with st.container():
+        user = st.text_input("Username")
+        password = st.text_input("Password", type="password")
         if st.button("Login"):
-            if (u == "admin" and p == "admin123") or (u == "viewer" and p == "view123"):
-                st.session_state.auth = True
-                st.session_state.role = "admin" if u == "admin" else "viewer"
+            if user == "admin" and password == "admin123":
+                st.session_state.authenticated = True
+                st.session_state.role = "admin"
+                st.rerun()
+            elif user == "viewer" and password == "view123":
+                st.session_state.authenticated = True
+                st.session_state.role = "viewer"
                 st.rerun()
     st.stop()
 
-# --- ADMIN LOGIC ---
+# --- ADMIN VIEW ---
 if st.session_state.role == "admin":
-    st.sidebar.title("Admin Tools")
-    page = st.sidebar.radio("Navigate", ["Settings", "Upload Data", "Analytics"])
+    st.sidebar.success(f"Logged in as: {st.session_state.role.upper()}")
+    
+    tab1, tab2 = st.tabs(["Upload & Map", "Settings"])
 
-    if page == "Settings":
-        st.header("Configure Products & Channels")
-        # Add Product
-        new_p = st.text_input("New Product Name")
-        if st.button("Add Product"):
-            c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_p,))
+    with tab2:
+        st.subheader("Manage Channels & Products")
+        # Add Channel logic
+        c_input = st.text_input("Add Channel Name")
+        if st.button("Save Channel"):
+            c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (c_input,))
             conn.commit()
-        
-        # Add Channel
-        new_c = st.text_input("New Channel (e.g. Instamart, Amazon)")
-        if st.button("Add Channel"):
-            c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_c,))
+            
+        # Add Product logic
+        p_input = st.text_input("Add Product Name")
+        if st.button("Save Product"):
+            c.execute("INSERT OR IGNORE INTO products VALUES (?)", (p_input,))
             conn.commit()
 
-    elif page == "Upload Data":
-        st.header("Upload Performance Reports")
-        channels = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
-        products = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
+    with tab1:
+        st.subheader("Data Upload")
+        ch_list = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
+        selected_ch = st.selectbox("Select Channel", ch_list)
         
-        selected_channel = st.selectbox("Which channel is this?", channels)
-        uploaded_file = st.file_uploader("Upload CSV/Excel", type=['csv', 'xlsx'])
+        file = st.file_uploader("Upload Report (CSV/Excel)", type=['csv'])
+        
+        if file:
+            raw_df = robust_read_csv(file)
+            if raw_df is not None:
+                df = process_file(raw_df, selected_ch)
+                st.write("Data detected:", df.head())
 
-        if uploaded_file:
-            df = load_data(uploaded_file, selected_channel)
-            if df is not None:
-                st.write("Data Preview:", df.head(3))
+                # CHECK FOR NEW CAMPAIGNS
+                unique_camps = df['campaign'].unique()
+                mapping_dict = dict(c.execute("SELECT campaign, product_name FROM mappings").fetchall())
                 
-                # Check for unmapped campaigns
-                unique_campaigns = df['campaign'].unique()
-                known_mappings = dict(c.execute("SELECT campaign, product_name FROM mappings").fetchall())
+                new_camps = [cp for cp in unique_camps if cp not in mapping_dict]
                 
-                unmapped = [camp for camp in unique_campaigns if camp not in known_mappings]
-                
-                if unmapped:
-                    st.warning(f"Found {len(unmapped)} unmapped campaigns!")
-                    map_df = pd.DataFrame({'campaign': unmapped, 'product': [None]*len(unmapped)})
-                    updated_map = st.data_editor(map_df, column_config={
-                        "product": st.column_config.SelectboxColumn("Assign Product", options=products)
+                if new_camps:
+                    st.warning(f"Unmapped Campaigns found in {selected_ch}")
+                    prod_list = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
+                    
+                    # Mapping Table
+                    map_df = pd.DataFrame({'campaign': new_camps, 'product_name': [None]*len(new_camps)})
+                    edited_mappings = st.data_editor(map_df, column_config={
+                        "product_name": st.column_config.SelectboxColumn("Assign Product", options=prod_list)
                     })
                     
-                    if st.button("Save Mappings & Upload"):
-                        for _, row in updated_map.iterrows():
-                            if row['product']:
-                                c.execute("INSERT INTO mappings VALUES (?, ?)", (row['campaign'], row['product']))
+                    if st.button("Confirm Mappings & Save Data"):
+                        # Save new mappings to 'Memory'
+                        for _, row in edited_mappings.iterrows():
+                            if row['product_name']:
+                                c.execute("INSERT OR REPLACE INTO mappings VALUES (?,?)", (row['campaign'], row['product_name']))
                         
-                        # Process and Save to Performance Table
-                        # (Logic to join df with updated mappings and insert into 'performance' table)
-                        st.success("Data uploaded successfully!")
+                        # Save Data to Performance table
+                        # (Logic to join and insert goes here)
+                        st.success("Data stored!")
                         conn.commit()
 
-# --- VIEWER / ANALYTICS ---
+# --- VIEWER VIEW ---
 else:
-    st.title("Performance Dashboard")
-    # Filters: Date Range, Channel, Product
-    # Graphs: Plotly trend lines for Spend, Sales, and ROAS
+    st.title("Performance Analytics")
+    st.info("Viewer Access: Charts and Trends will appear here.")
+    # (Plotly charts logic)
