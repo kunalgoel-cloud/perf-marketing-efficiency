@@ -213,3 +213,61 @@ elif choice == "Dashboard":
         st.write("**Campaign Performance**")
         cp_tab = f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
         st.dataframe(cp_tab.sort_values('spend', ascending=False).style.format({'spend':'₹{:.2f}', 'sales':'₹{:.2f}', 'ROAS':'{:.2f}x'}), use_container_width=True, hide_index=True)
+        
+        # --- DETAILED DATE-WISE DATA TABLE ---
+        st.divider()
+        st.subheader("📅 Detailed Date-wise Performance")
+        
+        # Prepare detailed table
+        detail_tab = f_df[['date', 'channel', 'product', 'campaign', 'spend', 'sales']].copy()
+        detail_tab['ROAS'] = detail_tab['sales'] / detail_tab['spend']
+        detail_tab = detail_tab.rename(columns={
+            'date': 'Date',
+            'channel': 'Channel',
+            'product': 'Product',
+            'campaign': 'Campaign',
+            'spend': 'Marketing Spend (₹)',
+            'sales': 'Ad Revenue (₹)',
+            'ROAS': 'ROAS'
+        })
+        detail_tab = detail_tab.sort_values('Date', ascending=False)
+        
+        # Display with formatting
+        st.dataframe(
+            detail_tab.style.format({
+                'Marketing Spend (₹)': '₹{:,.2f}',
+                'Ad Revenue (₹)': '₹{:,.2f}',
+                'ROAS': '{:.2f}x'
+            }),
+            use_container_width=True,
+            hide_index=True,
+            height=400
+        )
+        
+        # Download buttons
+        col_d1, col_d2 = st.columns(2)
+        
+        with col_d1:
+            # Convert to CSV for download
+            csv_data = detail_tab.to_csv(index=False)
+            st.download_button(
+                label="📥 Download as CSV",
+                data=csv_data,
+                file_name=f"marketing_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        
+        with col_d2:
+            # Convert to Excel for download
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                detail_tab.to_excel(writer, index=False, sheet_name='Performance Data')
+            excel_data = excel_buffer.getvalue()
+            st.download_button(
+                label="📥 Download as Excel",
+                data=excel_data,
+                file_name=f"marketing_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlx-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
