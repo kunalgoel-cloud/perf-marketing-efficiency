@@ -7,20 +7,21 @@ from datetime import datetime
 
 # --- 1. DATABASE SETUP (SUPABASE POOLER) ---
 try:
-    # Pulls the new Pooler URL from your Streamlit Secrets
+    # Pull connection string from secrets
     DB_URL = st.secrets["SUPABASE_DB_URL"]
     
-    # Engine configured for serverless pooling
+    # Engine configured for serverless pooling to avoid "stuck" connections
     engine = create_engine(
         DB_URL,
-        pool_size=5,          # Keeps 5 connections ready
-        max_overflow=10,      # Allows up to 10 extra if busy
+        pool_size=5,          
+        max_overflow=10,      
         pool_timeout=30,
         pool_recycle=1800,
+        pool_pre_ping=True,   # Critical: Checks if connection is alive before using
         connect_args={"sslmode": "require"}
     )
 except Exception as e:
-    st.error("Check your Streamlit Secrets for the correct Connection Pooler string.")
+    st.error("Missing SUPABASE_DB_URL in Streamlit Secrets.")
     st.stop()
 
 # Initialize Tables in Supabase
@@ -32,11 +33,11 @@ def init_db():
         conn.execute(text('CREATE TABLE IF NOT EXISTS performance (date DATE, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL)'))
         conn.commit()
 
-# Run initialization
+# Run initialization and catch connection errors immediately
 try:
     init_db()
 except Exception as e:
-    st.error(f"Database Connection Error: {e}")
+    st.error(f"Failed to connect to Supabase. Check your Secrets and Pooler settings. Error: {e}")
     st.stop()
 
 # --- 2. DATA PROCESSING ENGINE ---
@@ -66,7 +67,6 @@ def standardize_data(df, manual_date=None):
     }
     df = df.rename(columns=mapping)
     if 'campaign' not in df.columns: df['campaign'] = "CHANNEL_TOTAL"
-    
     for col in ['spend', 'sales']:
         if col not in df.columns: df[col] = 0.0
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
@@ -202,7 +202,7 @@ elif choice == "Dashboard":
         k2.metric("Revenue", f"₹{t_sales:,.0f}")
         k3.metric("ROAS", f"{roas:.2f}x")
 
-        # Trend Chart
+        # Efficiency Trend Chart
         ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
         ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
         
@@ -216,7 +216,8 @@ elif choice == "Dashboard":
             barmode='stack',
             yaxis=dict(title="Spend (₹)"),
             yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]),
-            legend=dict(orientation="h", y=1.2)
+            legend=dict(orientation="h", y=1.2),
+            hovermode="x unified"
         )
         st.plotly_chart(fig, use_container_width=True)
 
