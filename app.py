@@ -4,11 +4,12 @@ from sqlalchemy import create_engine, text
 import io
 import plotly.graph_objects as go
 
-# --- 1. DATABASE SETUP (STABLE CONFIG) ---
+# --- 1. DATABASE SETUP (STABLE POOLER CONFIG) ---
 try:
+    # Pulling the URL from Secrets
     DB_URL = st.secrets["SUPABASE_DB_URL"]
     
-    # Engine configured to bypass common pooling handshake issues
+    # Engine configuration to handle Port 6543 correctly
     engine = create_engine(
         DB_URL,
         pool_size=5,
@@ -17,12 +18,12 @@ try:
         connect_args={
             "sslmode": "require",
             "connect_timeout": 10,
-            # This is the critical fix for the pooling driver error
+            # This fixes the "prepare_threshold" error by passing it correctly to the driver
             "options": "-c prepare_threshold=0"
         }
     )
 except Exception as e:
-    st.error(f"Database setup error: {e}")
+    st.error(f"Connection setup failed: {e}")
     st.stop()
 
 # --- 2. DATA UTILITIES ---
@@ -34,8 +35,6 @@ def robust_read_file(file):
     for enc in ['utf-8', 'ISO-8859-1', 'cp1252', 'utf-16']:
         try:
             df_check = pd.read_csv(io.BytesIO(bytes_data), encoding=enc, nrows=10)
-            if 'METRICS_DATE' in df_check.columns:
-                return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
             return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
         except: continue
     return None
@@ -53,7 +52,7 @@ def standardize_data(df):
     df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
     return df.dropna(subset=['date'])
 
-# --- 3. LOGIN ---
+# --- 3. AUTHENTICATION ---
 if 'auth' not in st.session_state: st.session_state.auth = False
 if not st.session_state.auth:
     st.title("🛡️ Marketing Efficiency Portal")
@@ -91,12 +90,12 @@ if choice == "Settings":
                 st.rerun()
             st.dataframe(pd.read_sql("SELECT name FROM products", engine), hide_index=True)
 
-# --- 5. UPLOAD ---
+# --- 5. UPLOAD REPORTS ---
 elif choice == "Upload Reports":
-    st.header("📥 Upload Data")
+    st.header("📥 Data Upload")
     chs = pd.read_sql("SELECT name FROM channels", engine)['name'].tolist()
-    sel_ch = st.selectbox("Channel", chs)
-    file = st.file_uploader("Choose File", type=['csv', 'xlsx'])
+    sel_ch = st.selectbox("Select Channel", chs)
+    file = st.file_uploader("Upload Report", type=['csv', 'xlsx'])
     
     if file:
         df = standardize_data(robust_read_file(file))
@@ -105,18 +104,18 @@ elif choice == "Upload Reports":
         unmapped = [c for c in df['campaign'].unique() if c not in maps]
         
         if unmapped:
-            st.warning(f"Map {len(unmapped)} campaigns")
+            st.warning(f"Unmapped Campaigns Found: {len(unmapped)}")
             prods = pd.read_sql("SELECT name FROM products", engine)['name'].tolist() + ["Brand"]
-            with st.form("m"):
+            with st.form("mapping_form"):
                 nm = {c: st.multiselect(f"Map {c}", prods) for c in unmapped}
-                if st.form_submit_button("Save"):
+                if st.form_submit_button("Save Mappings"):
                     with engine.connect() as conn:
                         for cp, pl in nm.items():
-                            for p in pl: conn.execute(text("INSERT INTO mappings VALUES (:c,:p)"), {"c":cp, "p":p})
+                            for p_name in pl: conn.execute(text("INSERT INTO mappings VALUES (:c,:p)"), {"c":cp, "p":p_name})
                         conn.commit()
                     st.rerun()
         else:
-            if st.button("🚀 Sync to Supabase"):
+            if st.button("🚀 Push to Supabase"):
                 with engine.connect() as conn:
                     for _, row in df.iterrows():
                         targets = maps.get(row['campaign'], ["Unmapped"])
@@ -124,25 +123,25 @@ elif choice == "Upload Reports":
                             conn.execute(text("INSERT INTO performance (date, channel, campaign, product, spend, sales) VALUES (:d,:c,:cp,:p,:s,:sl)"),
                                          {"d":row['date'], "c":sel_ch, "cp":row['campaign'], "p":t, "s":row['spend']/len(targets), "sl":row['sales']/len(targets)})
                     conn.commit()
-                st.success("Uploaded!")
+                st.success("Data Synced!")
 
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
-    st.header("📊 Dashboard")
-    # This line triggered the original error
+    st.header("📊 Performance Dashboard")
+    # This line previously caused the OperationalError
     df_p = pd.read_sql("SELECT * FROM performance", engine) 
     
     if not df_p.empty:
         df_p['date'] = pd.to_datetime(df_p['date'])
-        ch_f = st.sidebar.multiselect("Channels", df_p['channel'].unique(), default=df_p['channel'].unique())
+        ch_f = st.sidebar.multiselect("Filter Channel", df_p['channel'].unique(), default=df_p['channel'].unique())
         f_df = df_p[df_p['channel'].isin(ch_f)]
         
         c1, c2, c3 = st.columns(3)
-        s, r = f_df['spend'].sum(), f_df['sales'].sum()
-        c1.metric("Spend", f"₹{s:,.0f}")
-        c2.metric("Revenue", f"₹{r:,.0f}")
-        c3.metric("ROAS", f"{(r/s):.2f}x" if s > 0 else "0.00x")
+        s_val, r_val = f_df['spend'].sum(), f_df['sales'].sum()
+        c1.metric("Total Spend", f"₹{s_val:,.0f}")
+        c2.metric("Total Revenue", f"₹{r_val:,.0f}")
+        c3.metric("ROAS", f"{(r_val/s_val):.2f}x" if s_val > 0 else "0.00x")
         
         st.bar_chart(f_df.groupby('date')['spend'].sum())
     else:
-        st.info("No data yet. Go to 'Upload Reports'.")
+        st.info("No data available. Please upload reports first.")
