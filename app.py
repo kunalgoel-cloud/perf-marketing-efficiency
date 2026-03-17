@@ -1,19 +1,29 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+from sqlalchemy import create_engine, text
 import io
 import plotly.graph_objects as go
 from datetime import datetime
 
-# --- 1. DATABASE SETUP ---
-# Ensure we use the existing v10 database
-conn = sqlite3.connect('marketing_v10_final.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS channels (name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT, product_name TEXT, UNIQUE(campaign, product_name))')
-c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL, clicks REAL, orders REAL)')
-conn.commit()
+# --- 1. DATABASE SETUP (SUPABASE) ---
+try:
+    # Pulls the URL we just saved in Streamlit Secrets
+    DB_URL = st.secrets["SUPABASE_DB_URL"]
+    engine = create_engine(DB_URL)
+except Exception as e:
+    st.error("Connection String not found in Streamlit Secrets!")
+    st.stop()
+
+# Initialize Tables in Supabase if they don't exist
+def init_db():
+    with engine.connect() as conn:
+        conn.execute(text('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)'))
+        conn.execute(text('CREATE TABLE IF NOT EXISTS channels (name TEXT UNIQUE)'))
+        conn.execute(text('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT, product_name TEXT, UNIQUE(campaign, product_name))'))
+        conn.execute(text('CREATE TABLE IF NOT EXISTS performance (date DATE, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL)'))
+        conn.commit()
+
+init_db()
 
 # --- 2. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
@@ -45,14 +55,12 @@ def standardize_data(df, manual_date=None):
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
     
     df = df[df['spend'] > 0].copy()
-
     if manual_date:
-        df['date'] = manual_date.strftime('%Y-%m-%d')
+        df['date'] = pd.to_datetime(manual_date)
     else:
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
-        df = df.dropna(subset=['date'])
-        df['date'] = df['date'].dt.strftime('%Y-%m-%d')
-    return df[['date', 'campaign', 'spend', 'sales']]
+    
+    return df.dropna(subset=['date'])[['date', 'campaign', 'spend', 'sales']]
 
 # --- 3. AUTHENTICATION ---
 if 'auth' not in st.session_state: st.session_state.auth = False
@@ -70,57 +78,50 @@ choice = st.sidebar.selectbox("Navigation", ["Dashboard", "Upload Reports", "Set
 # --- 4. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
-    t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Manual Cleanup"])
+    t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Cleanup"])
+    
     with t1:
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Channels")
             new_ch = st.text_input("Add Channel")
             if st.button("Save Channel"): 
-                c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
-                conn.commit(); st.rerun()
-            st.dataframe(pd.read_sql("SELECT name FROM channels", conn), hide_index=True)
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO channels (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_ch})
+                    conn.commit()
+                st.rerun()
+            st.dataframe(pd.read_sql("SELECT name FROM channels", engine), hide_index=True)
         with col2:
             st.subheader("Products")
             new_pr = st.text_input("Add Product")
             if st.button("Save Product"): 
-                c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
-                conn.commit(); st.rerun()
-            st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
+                with engine.connect() as conn:
+                    conn.execute(text("INSERT INTO products (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_pr})
+                    conn.commit()
+                st.rerun()
+            st.dataframe(pd.read_sql("SELECT name FROM products", engine), hide_index=True)
+
     with t2:
         st.subheader("🔗 Mapping Manager")
-        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", conn)
-        search = st.text_input("🔍 Search Campaign")
-        if search: df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
+        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", engine)
         for _, row in df_map.iterrows():
             m_col1, m_col2 = st.columns([3, 1])
             m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
             if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
-                c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", (row['campaign'], row['product_name']))
-                conn.commit(); st.rerun()
-    with t3:
-        st.subheader("🗑️ Manual Delete Records")
-        st.warning("Only use this if you want to permanently remove historic data.")
-        d_col1, d_col2 = st.columns(2)
-        with d_col1:
-            chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
-            target_ch = st.selectbox("Channel", ["Select"] + chs)
-        with d_col2:
-            target_date = st.date_input("Date", value=None)
-        if st.button("Delete Selected Records", type="primary"):
-            if target_ch != "Select" and target_date:
-                d_str = target_date.strftime('%Y-%m-%d')
-                c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
-                conn.commit(); st.warning(f"Deleted {target_ch} for {d_str}")
+                with engine.connect() as conn:
+                    conn.execute(text("DELETE FROM mappings WHERE campaign=:c AND product_name=:p"), {"c": row['campaign'], "p": row['product_name']})
+                    conn.commit()
+                st.rerun()
 
-# --- 5. UPLOAD (WITH HISTORIC PROTECTION) ---
+# --- 5. UPLOAD (WITH SUPABASE PERSISTENCE) ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     u_col1, u_col2 = st.columns(2)
     with u_col1: manual_date = st.date_input("Date Override (Optional)", value=None)
     with u_col2:
-        chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
-        sel_ch = st.selectbox("Assign Channel", chs)
+        chs_df = pd.read_sql("SELECT name FROM channels", engine)
+        chs = chs_df['name'].tolist()
+        sel_ch = st.selectbox("Assign Channel", chs if chs else ["Add Channels in Settings first"])
     
     file = st.file_uploader("Upload File", type=['csv', 'xlsx'])
     if file:
@@ -128,47 +129,48 @@ elif choice == "Upload Reports":
         if raw_df is not None:
             df = standardize_data(raw_df, manual_date=manual_date)
             
-            # Mapping Logic
-            mappings = {}
-            for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
-                mappings.setdefault(r[0], []).append(r[1])
+            # Fetch mappings
+            df_m = pd.read_sql("SELECT * FROM mappings", engine)
+            mappings = df_m.groupby('campaign')['product_name'].apply(list).to_dict()
             
             unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
             if unmapped:
-                st.warning(f"Map {len(unmapped)} new campaigns")
-                prods = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
+                st.warning(f"Map {len(unmapped)} campaigns")
+                prods_df = pd.read_sql("SELECT name FROM products", engine)
+                prods = prods_df['name'].tolist() + ["Brand/Global"]
                 with st.form("map_form"):
                     new_maps = {cp: st.multiselect(f"Map: {cp}", prods) for cp in unmapped}
                     if st.form_submit_button("Save Mappings"):
-                        for cp, pl in new_maps.items():
-                            for pn in pl: c.execute("INSERT INTO mappings VALUES (?,?)", (cp, pn))
-                        conn.commit(); st.rerun()
+                        with engine.connect() as conn:
+                            for cp, p_list in new_maps.items():
+                                for p_name in p_list:
+                                    conn.execute(text("INSERT INTO mappings (campaign, product_name) VALUES (:c, :p) ON CONFLICT DO NOTHING"), {"c": cp, "p": p_name})
+                            conn.commit()
+                        st.rerun()
             else:
-                if st.button("🚀 Push to Dashboard"):
-                    # PROTECTION LOGIC:
-                    # Find all unique dates in the current upload
-                    upload_dates = df['date'].unique()
-                    
-                    # 1. Clean up old entries for these dates/channel to avoid duplicates
-                    for d_val in upload_dates:
-                        c.execute("DELETE FROM performance WHERE channel=? AND date=?", (sel_ch, d_val))
-                    
-                    # 2. Insert new data
-                    for _, row in df.iterrows():
-                        targets = mappings.get(row['campaign'], ["Unmapped"])
-                        n = len(targets)
-                        for p_name in targets:
-                            c.execute("INSERT INTO performance VALUES (?,?,?,?,?,?,?,?)", 
-                                      (row['date'], sel_ch, row['campaign'], p_name, row['spend']/n, row['sales']/n, 0, 0))
-                    
-                    conn.commit()
-                    st.success(f"Successfully added data. Historic data for other dates remains safe.")
+                if st.button("🚀 Push to Supabase"):
+                    with engine.connect() as conn:
+                        # Deduplication: Remove old data for these dates/channel
+                        unique_dates = df['date'].dt.strftime('%Y-%m-%d').unique()
+                        for d_val in unique_dates:
+                            conn.execute(text("DELETE FROM performance WHERE channel=:ch AND date=:dt"), {"ch": sel_ch, "dt": d_val})
+                        
+                        # Insert New Data
+                        for _, row in df.iterrows():
+                            targets = mappings.get(row['campaign'], ["Unmapped"])
+                            n = len(targets)
+                            for p_name in targets:
+                                conn.execute(text("INSERT INTO performance (date, channel, campaign, product, spend, sales) VALUES (:d, :c, :cp, :p, :s, :sl)"),
+                                             {"d": row['date'], "c": sel_ch, "cp": row['campaign'], "p": p_name, "s": row['spend']/n, "sl": row['sales']/n})
+                        conn.commit()
+                    st.success("Historic data successfully saved in the cloud!")
 
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
-    df_p = pd.read_sql("SELECT * FROM performance", conn)
-    if df_p.empty: st.info("No data found.")
+    df_p = pd.read_sql("SELECT * FROM performance", engine)
+    if df_p.empty:
+        st.info("No data in Supabase yet. Please upload a report.")
     else:
         df_p['date'] = pd.to_datetime(df_p['date'])
         st.sidebar.subheader("Filters")
@@ -177,18 +179,21 @@ elif choice == "Dashboard":
         pr_f = st.sidebar.multiselect("Products", df_p['product'].unique(), default=df_p['product'].unique())
 
         if len(dr) == 2:
-            f_df = df_p[(df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
-        else: f_df = df_p[(df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
-
-        # KPIs & Trend Chart... (rest of the dashboard remains the same)
+            mask = (df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))
+        else:
+            mask = (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))
+        
+        f_df = df_p[mask]
+        
+        # Metrics
         t_spend, t_sales = f_df['spend'].sum(), f_df['sales'].sum()
         roas = t_sales / t_spend if t_spend > 0 else 0
         k1, k2, k3 = st.columns(3)
-        k1.metric("Spend", f"₹{t_spend:,.0f}")
-        k2.metric("Revenue", f"₹{t_sales:,.0f}")
-        k3.metric("ROAS", f"{roas:.2f}x")
+        k1.metric("Total Spend", f"₹{t_spend:,.0f}")
+        k2.metric("Total Revenue", f"₹{t_sales:,.0f}")
+        k3.metric("Total ROAS", f"{roas:.2f}x")
 
-        # Multi-Channel Trend Chart
+        # Trend Chart
         ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
         ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
         fig = go.Figure()
@@ -196,11 +201,9 @@ elif choice == "Dashboard":
             ch_data = ch_trend[ch_trend['channel'] == channel]
             fig.add_trace(go.Bar(x=ch_data['date'], y=ch_data['spend'], name=f"{channel} Spend"))
             fig.add_trace(go.Scatter(x=ch_data['date'], y=ch_data['ROAS'], name=f"{channel} ROAS", yaxis="y2"))
-        
-        fig.update_layout(barmode='stack', yaxis2=dict(overlaying="y", side="right"), legend=dict(orientation="h", y=1.2))
+        fig.update_layout(barmode='stack', yaxis2=dict(overlaying="y", side="right", title="ROAS"), legend=dict(orientation="h", y=1.1))
         st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
-        st.write("**Campaign Performance Detail**")
-        cp_tab = f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
-        st.dataframe(cp_tab.sort_values('spend', ascending=False).style.format({'spend':'₹{:.2f}', 'sales':'₹{:.2f}', 'ROAS':'{:.2f}x'}), use_container_width=True, hide_index=True)
+        st.write("**Campaign Performance**")
+        st.dataframe(f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
