@@ -1,4 +1,6 @@
 streamlit
 pandas
-openpyxl
 plotly
+sqlalchemy
+psycopg2-binary
+openpyxl
