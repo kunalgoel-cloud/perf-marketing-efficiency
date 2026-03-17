@@ -4,12 +4,10 @@ from sqlalchemy import create_engine, text
 import io
 import plotly.graph_objects as go
 
-# --- 1. DATABASE SETUP (STABLE POOLER CONFIG) ---
+# --- 1. DATABASE SETUP (POOLER OPTIMIZED) ---
 try:
-    # Pulling the URL from Secrets
     DB_URL = st.secrets["SUPABASE_DB_URL"]
     
-    # Engine configuration to handle Port 6543 correctly
     engine = create_engine(
         DB_URL,
         pool_size=5,
@@ -17,16 +15,16 @@ try:
         pool_pre_ping=True,
         connect_args={
             "sslmode": "require",
-            "connect_timeout": 10,
-            # This fixes the "prepare_threshold" error by passing it correctly to the driver
+            "connect_timeout": 15,
+            # This 'options' string is mandatory for Supabase Poolers
             "options": "-c prepare_threshold=0"
         }
     )
 except Exception as e:
-    st.error(f"Connection setup failed: {e}")
+    st.error(f"Database connection setup failed: {e}")
     st.stop()
 
-# --- 2. DATA UTILITIES ---
+# --- 2. DATA PROCESSING ---
 def robust_read_file(file):
     file_name = file.name.lower()
     if file_name.endswith(('.xlsx', '.xls')):
@@ -34,7 +32,6 @@ def robust_read_file(file):
     bytes_data = file.read()
     for enc in ['utf-8', 'ISO-8859-1', 'cp1252', 'utf-16']:
         try:
-            df_check = pd.read_csv(io.BytesIO(bytes_data), encoding=enc, nrows=10)
             return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
         except: continue
     return None
@@ -52,7 +49,7 @@ def standardize_data(df):
     df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
     return df.dropna(subset=['date'])
 
-# --- 3. AUTHENTICATION ---
+# --- 3. LOGIN ---
 if 'auth' not in st.session_state: st.session_state.auth = False
 if not st.session_state.auth:
     st.title("🛡️ Marketing Efficiency Portal")
@@ -104,9 +101,9 @@ elif choice == "Upload Reports":
         unmapped = [c for c in df['campaign'].unique() if c not in maps]
         
         if unmapped:
-            st.warning(f"Unmapped Campaigns Found: {len(unmapped)}")
+            st.warning(f"Map {len(unmapped)} campaigns")
             prods = pd.read_sql("SELECT name FROM products", engine)['name'].tolist() + ["Brand"]
-            with st.form("mapping_form"):
+            with st.form("m_form"):
                 nm = {c: st.multiselect(f"Map {c}", prods) for c in unmapped}
                 if st.form_submit_button("Save Mappings"):
                     with engine.connect() as conn:
@@ -128,7 +125,7 @@ elif choice == "Upload Reports":
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
-    # This line previously caused the OperationalError
+    # This query uses the engine we just optimized
     df_p = pd.read_sql("SELECT * FROM performance", engine) 
     
     if not df_p.empty:
@@ -144,4 +141,4 @@ elif choice == "Dashboard":
         
         st.bar_chart(f_df.groupby('date')['spend'].sum())
     else:
-        st.info("No data available. Please upload reports first.")
+        st.info("Dashboard is empty. Use 'Upload Reports' to add data.")
