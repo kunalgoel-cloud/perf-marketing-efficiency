@@ -7,14 +7,21 @@ from datetime import datetime
 
 # --- 1. DATABASE SETUP (SUPABASE) ---
 try:
-    # Pulls the URL we just saved in Streamlit Secrets
+    # Ensure your Secret includes ?sslmode=require at the end
     DB_URL = st.secrets["SUPABASE_DB_URL"]
-    engine = create_engine(DB_URL)
+    
+    # Updated engine with SSL and connectivity fixes
+    engine = create_engine(
+        DB_URL,
+        connect_args={"sslmode": "require"},
+        pool_pre_ping=True,
+        pool_recycle=3600
+    )
 except Exception as e:
-    st.error("Connection String not found in Streamlit Secrets!")
+    st.error("Database connection configuration failed. Check your Streamlit Secrets.")
     st.stop()
 
-# Initialize Tables in Supabase if they don't exist
+# Initialize Tables in Supabase
 def init_db():
     with engine.connect() as conn:
         conn.execute(text('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)'))
@@ -23,7 +30,12 @@ def init_db():
         conn.execute(text('CREATE TABLE IF NOT EXISTS performance (date DATE, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL)'))
         conn.commit()
 
-init_db()
+# Run initialization
+try:
+    init_db()
+except Exception as e:
+    st.error(f"Error connecting to Supabase: {e}")
+    st.stop()
 
 # --- 2. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
@@ -34,7 +46,9 @@ def robust_read_file(file):
     for enc in ['utf-8', 'ISO-8859-1', 'cp1252', 'utf-16']:
         try:
             df_check = pd.read_csv(io.BytesIO(bytes_data), encoding=enc, nrows=10)
-            if 'METRICS_DATE' not in df_check.columns and any("Selected Filters" in str(col) for col in df_check.columns):
+            if 'METRICS_DATE' in df_check.columns:
+                return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
+            if any("Selected Filters" in str(col) for col in df_check.columns):
                  return pd.read_csv(io.BytesIO(bytes_data), encoding=enc, skiprows=6)
             return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
         except: continue
@@ -50,6 +64,7 @@ def standardize_data(df, manual_date=None):
     }
     df = df.rename(columns=mapping)
     if 'campaign' not in df.columns: df['campaign'] = "CHANNEL_TOTAL"
+    
     for col in ['spend', 'sales']:
         if col not in df.columns: df[col] = 0.0
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
@@ -113,7 +128,7 @@ if choice == "Settings":
                     conn.commit()
                 st.rerun()
 
-# --- 5. UPLOAD (WITH SUPABASE PERSISTENCE) ---
+# --- 5. UPLOAD ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     u_col1, u_col2 = st.columns(2)
@@ -128,14 +143,12 @@ elif choice == "Upload Reports":
         raw_df = robust_read_file(file)
         if raw_df is not None:
             df = standardize_data(raw_df, manual_date=manual_date)
-            
-            # Fetch mappings
             df_m = pd.read_sql("SELECT * FROM mappings", engine)
             mappings = df_m.groupby('campaign')['product_name'].apply(list).to_dict()
             
             unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
             if unmapped:
-                st.warning(f"Map {len(unmapped)} campaigns")
+                st.warning(f"Map {len(unmapped)} new campaigns")
                 prods_df = pd.read_sql("SELECT name FROM products", engine)
                 prods = prods_df['name'].tolist() + ["Brand/Global"]
                 with st.form("map_form"):
@@ -150,12 +163,10 @@ elif choice == "Upload Reports":
             else:
                 if st.button("🚀 Push to Supabase"):
                     with engine.connect() as conn:
-                        # Deduplication: Remove old data for these dates/channel
                         unique_dates = df['date'].dt.strftime('%Y-%m-%d').unique()
                         for d_val in unique_dates:
                             conn.execute(text("DELETE FROM performance WHERE channel=:ch AND date=:dt"), {"ch": sel_ch, "dt": d_val})
                         
-                        # Insert New Data
                         for _, row in df.iterrows():
                             targets = mappings.get(row['campaign'], ["Unmapped"])
                             n = len(targets)
@@ -163,14 +174,14 @@ elif choice == "Upload Reports":
                                 conn.execute(text("INSERT INTO performance (date, channel, campaign, product, spend, sales) VALUES (:d, :c, :cp, :p, :s, :sl)"),
                                              {"d": row['date'], "c": sel_ch, "cp": row['campaign'], "p": p_name, "s": row['spend']/n, "sl": row['sales']/n})
                         conn.commit()
-                    st.success("Historic data successfully saved in the cloud!")
+                    st.success("Cloud Sync Complete!")
 
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
     df_p = pd.read_sql("SELECT * FROM performance", engine)
     if df_p.empty:
-        st.info("No data in Supabase yet. Please upload a report.")
+        st.info("Dashboard is empty. Please upload data.")
     else:
         df_p['date'] = pd.to_datetime(df_p['date'])
         st.sidebar.subheader("Filters")
@@ -178,32 +189,36 @@ elif choice == "Dashboard":
         ch_f = st.sidebar.multiselect("Channels", df_p['channel'].unique(), default=df_p['channel'].unique())
         pr_f = st.sidebar.multiselect("Products", df_p['product'].unique(), default=df_p['product'].unique())
 
-        if len(dr) == 2:
-            mask = (df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))
-        else:
-            mask = (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))
-        
+        mask = (df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))
         f_df = df_p[mask]
         
         # Metrics
         t_spend, t_sales = f_df['spend'].sum(), f_df['sales'].sum()
         roas = t_sales / t_spend if t_spend > 0 else 0
         k1, k2, k3 = st.columns(3)
-        k1.metric("Total Spend", f"₹{t_spend:,.0f}")
-        k2.metric("Total Revenue", f"₹{t_sales:,.0f}")
-        k3.metric("Total ROAS", f"{roas:.2f}x")
+        k1.metric("Spend", f"₹{t_spend:,.0f}")
+        k2.metric("Revenue", f"₹{t_sales:,.0f}")
+        k3.metric("ROAS", f"{roas:.2f}x")
 
-        # Trend Chart
+        # Efficiency Trend Chart
         ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
         ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
+        
         fig = go.Figure()
         for channel in ch_trend['channel'].unique():
             ch_data = ch_trend[ch_trend['channel'] == channel]
             fig.add_trace(go.Bar(x=ch_data['date'], y=ch_data['spend'], name=f"{channel} Spend"))
             fig.add_trace(go.Scatter(x=ch_data['date'], y=ch_data['ROAS'], name=f"{channel} ROAS", yaxis="y2"))
-        fig.update_layout(barmode='stack', yaxis2=dict(overlaying="y", side="right", title="ROAS"), legend=dict(orientation="h", y=1.1))
+            
+        fig.update_layout(
+            barmode='stack',
+            yaxis=dict(title="Spend (₹)"),
+            yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]),
+            legend=dict(orientation="h", y=1.2),
+            hovermode="x unified"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
-        st.write("**Campaign Performance**")
-        st.dataframe(f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
+        st.write("**Channel Breakdown**")
+        st.dataframe(f_df.groupby('channel').agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
