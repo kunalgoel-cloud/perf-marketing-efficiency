@@ -5,20 +5,22 @@ import io
 import plotly.graph_objects as go
 from datetime import datetime
 
-# --- 1. DATABASE SETUP (SUPABASE) ---
+# --- 1. DATABASE SETUP (SUPABASE POOLER) ---
 try:
-    # Ensure your Secret includes ?sslmode=require at the end
+    # Pulls the new Pooler URL from your Streamlit Secrets
     DB_URL = st.secrets["SUPABASE_DB_URL"]
     
-    # Updated engine with SSL and connectivity fixes
+    # Engine configured for serverless pooling
     engine = create_engine(
         DB_URL,
-        connect_args={"sslmode": "require"},
-        pool_pre_ping=True,
-        pool_recycle=3600
+        pool_size=5,          # Keeps 5 connections ready
+        max_overflow=10,      # Allows up to 10 extra if busy
+        pool_timeout=30,
+        pool_recycle=1800,
+        connect_args={"sslmode": "require"}
     )
 except Exception as e:
-    st.error("Database connection configuration failed. Check your Streamlit Secrets.")
+    st.error("Check your Streamlit Secrets for the correct Connection Pooler string.")
     st.stop()
 
 # Initialize Tables in Supabase
@@ -34,7 +36,7 @@ def init_db():
 try:
     init_db()
 except Exception as e:
-    st.error(f"Error connecting to Supabase: {e}")
+    st.error(f"Database Connection Error: {e}")
     st.stop()
 
 # --- 2. DATA PROCESSING ENGINE ---
@@ -148,7 +150,7 @@ elif choice == "Upload Reports":
             
             unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
             if unmapped:
-                st.warning(f"Map {len(unmapped)} new campaigns")
+                st.warning(f"Map {len(unmapped)} campaigns")
                 prods_df = pd.read_sql("SELECT name FROM products", engine)
                 prods = prods_df['name'].tolist() + ["Brand/Global"]
                 with st.form("map_form"):
@@ -200,7 +202,7 @@ elif choice == "Dashboard":
         k2.metric("Revenue", f"₹{t_sales:,.0f}")
         k3.metric("ROAS", f"{roas:.2f}x")
 
-        # Efficiency Trend Chart
+        # Trend Chart
         ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
         ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
         
@@ -214,8 +216,7 @@ elif choice == "Dashboard":
             barmode='stack',
             yaxis=dict(title="Spend (₹)"),
             yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]),
-            legend=dict(orientation="h", y=1.2),
-            hovermode="x unified"
+            legend=dict(orientation="h", y=1.2)
         )
         st.plotly_chart(fig, use_container_width=True)
 
