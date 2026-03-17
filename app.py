@@ -6,14 +6,19 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- 1. DATABASE SETUP (DIRECT CONNECTION) ---
+# Project ID: gzhvecepjlljawxpbtap
 try:
-    # Pulling the URL from Streamlit Secrets
+    # Use the postgresql+psycopg2 prefix in your Streamlit Secrets for this to work
     DB_URL = st.secrets["SUPABASE_DB_URL"]
     
-    # Setup the engine with stability settings
     engine = create_engine(
         DB_URL,
-        connect_args={"sslmode": "require", "connect_timeout": 10},
+        # AUTOCOMMIT prevents the app from getting stuck on "read_sql" calls
+        isolation_level="AUTOCOMMIT",
+        connect_args={
+            "sslmode": "require", 
+            "connect_timeout": 10
+        },
         pool_pre_ping=True,
         pool_recycle=300
     )
@@ -67,6 +72,7 @@ if not st.session_state.auth:
     st.title("🛡️ Secure Marketing Portal")
     u, p = st.text_input("User"), st.text_input("Password", type="password")
     if st.button("Login"):
+        # Default credentials for your portal
         if (u == "admin" and p == "admin123") or (u == "viewer" and p == "view123"):
             st.session_state.auth, st.session_state.role = True, u
             st.rerun()
@@ -87,7 +93,6 @@ if choice == "Settings":
             if st.button("Save Channel"): 
                 with engine.connect() as conn:
                     conn.execute(text("INSERT INTO channels (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_ch})
-                    conn.commit()
                 st.rerun()
             st.dataframe(pd.read_sql("SELECT name FROM channels", engine), hide_index=True)
         with col2:
@@ -96,7 +101,6 @@ if choice == "Settings":
             if st.button("Save Product"): 
                 with engine.connect() as conn:
                     conn.execute(text("INSERT INTO products (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_pr})
-                    conn.commit()
                 st.rerun()
             st.dataframe(pd.read_sql("SELECT name FROM products", engine), hide_index=True)
 
@@ -109,7 +113,6 @@ if choice == "Settings":
             if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
                 with engine.connect() as conn:
                     conn.execute(text("DELETE FROM mappings WHERE campaign=:c AND product_name=:p"), {"c": row['campaign'], "p": row['product_name']})
-                    conn.commit()
                 st.rerun()
 
 # --- 5. UPLOAD ---
@@ -142,7 +145,6 @@ elif choice == "Upload Reports":
                             for cp, p_list in new_maps.items():
                                 for p_name in p_list:
                                     conn.execute(text("INSERT INTO mappings (campaign, product_name) VALUES (:c, :p) ON CONFLICT DO NOTHING"), {"c": cp, "p": p_name})
-                            conn.commit()
                         st.rerun()
             else:
                 if st.button("🚀 Push to Supabase"):
@@ -157,13 +159,14 @@ elif choice == "Upload Reports":
                             for p_name in targets:
                                 conn.execute(text("INSERT INTO performance (date, channel, campaign, product, spend, sales) VALUES (:d, :c, :cp, :p, :s, :sl)"),
                                              {"d": row['date'], "c": sel_ch, "cp": row['campaign'], "p": p_name, "s": row['spend']/n, "sl": row['sales']/n})
-                        conn.commit()
                     st.success("Cloud Sync Complete!")
 
 # --- 6. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
-    df_p = pd.read_sql("SELECT * FROM performance", engine)
+    # This is line 166 where the previous error occurred
+    df_p = pd.read_sql("SELECT * FROM performance", engine) 
+    
     if df_p.empty:
         st.info("Dashboard is empty. Please upload data.")
     else:
@@ -184,7 +187,7 @@ elif choice == "Dashboard":
         k2.metric("Total Revenue", f"₹{t_sales:,.0f}")
         k3.metric("Total ROAS", f"{roas:.2f}x")
 
-        # Trend Visualization
+        # Efficiency Trend Chart
         ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
         ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
         
