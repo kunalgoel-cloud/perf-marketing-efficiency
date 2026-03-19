@@ -4,32 +4,96 @@ import sqlite3
 import io
 import plotly.graph_objects as go
 from datetime import datetime
+import os
 
-# --- 1. DATABASE SETUP ---
-conn = sqlite3.connect('marketing_v10_final.db', check_same_thread=False)
+# --- 1. IMPROVED DATABASE SETUP WITH PERSISTENCE ---
+# Using the SAME database file to preserve existing data
+DB_PATH = 'marketing_v10_final.db'
+
+def get_db_connection():
+    """Create a database connection"""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+    # Enable WAL mode for better concurrent access
+    conn.execute('PRAGMA journal_mode=WAL')
+    return conn
+
+def init_database():
+    """Initialize database tables ONLY if they don't exist - preserves existing data"""
+    conn = get_db_connection()
+    c = conn.cursor()
+    
+    # Create tables ONLY if they don't exist (IF NOT EXISTS ensures no data loss)
+    c.execute('''CREATE TABLE IF NOT EXISTS products (
+        name TEXT UNIQUE PRIMARY KEY
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS channels (
+        name TEXT UNIQUE PRIMARY KEY
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS mappings (
+        campaign TEXT,
+        product_name TEXT,
+        UNIQUE(campaign, product_name)
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS performance (
+        date TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        campaign TEXT NOT NULL,
+        product TEXT NOT NULL,
+        spend REAL DEFAULT 0,
+        sales REAL DEFAULT 0,
+        clicks REAL DEFAULT 0,
+        orders REAL DEFAULT 0
+    )''')
+    
+    # Create indexes for better query performance (IF NOT EXISTS prevents errors)
+    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_date ON performance(date)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_channel ON performance(channel)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_product ON performance(product)')
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database on app start (preserves existing data)
+init_database()
+
+# Create a persistent connection
+@st.cache_resource
+def get_persistent_connection():
+    """Cache the database connection across reruns"""
+    return get_db_connection()
+
+conn = get_persistent_connection()
 c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS products (name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS channels (name TEXT UNIQUE)')
-c.execute('CREATE TABLE IF NOT EXISTS mappings (campaign TEXT, product_name TEXT, UNIQUE(campaign, product_name))')
-c.execute('CREATE TABLE IF NOT EXISTS performance (date TEXT, channel TEXT, campaign TEXT, product TEXT, spend REAL, sales REAL, clicks REAL, orders REAL)')
-conn.commit()
 
 # --- 2. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
+    """Read CSV or Excel files with multiple encoding attempts"""
     file_name = file.name.lower()
     if file_name.endswith(('.xlsx', '.xls')):
-        return pd.read_excel(file)
+        try:
+            return pd.read_excel(file)
+        except Exception as e:
+            st.error(f"Error reading Excel file: {str(e)}")
+            return None
+    
     bytes_data = file.read()
     for enc in ['utf-8', 'ISO-8859-1', 'cp1252', 'utf-16']:
         try:
             df_check = pd.read_csv(io.BytesIO(bytes_data), encoding=enc, nrows=10)
             if 'METRICS_DATE' not in df_check.columns and any("Selected Filters" in str(col) for col in df_check.columns):
-                 return pd.read_csv(io.BytesIO(bytes_data), encoding=enc, skiprows=6)
+                return pd.read_csv(io.BytesIO(bytes_data), encoding=enc, skiprows=6)
             return pd.read_csv(io.BytesIO(bytes_data), encoding=enc)
-        except: continue
+        except: 
+            continue
+    
+    st.error("Could not read file with any encoding")
     return None
 
 def standardize_data(df, manual_date=None):
+    """Standardize column names and data formats"""
     mapping = {
         'METRICS_DATE': 'date', 'CAMPAIGN_NAME': 'campaign', 
         'TOTAL_BUDGET_BURNT': 'spend', 'TOTAL_SPEND': 'spend',
@@ -38,178 +102,569 @@ def standardize_data(df, manual_date=None):
         'Date': 'date', 'Ad Spend': 'spend', 'Ad Revenue': 'sales'
     }
     df = df.rename(columns=mapping)
-    if 'campaign' not in df.columns: df['campaign'] = "CHANNEL_TOTAL"
+    
+    if 'campaign' not in df.columns: 
+        df['campaign'] = "CHANNEL_TOTAL"
+    
     for col in ['spend', 'sales']:
-        if col not in df.columns: df[col] = 0.0
+        if col not in df.columns: 
+            df[col] = 0.0
         df[col] = pd.to_numeric(df[col].astype(str).str.replace(r'[₹,]', '', regex=True), errors='coerce').fillna(0)
+    
     df = df[df['spend'] > 0].copy()
+    
     if manual_date:
         df['date'] = manual_date.strftime('%Y-%m-%d')
     else:
         df['date'] = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
         df = df.dropna(subset=['date'])
         df['date'] = df['date'].dt.strftime('%Y-%m-%d')
+    
     return df[['date', 'campaign', 'spend', 'sales']]
 
 # --- 3. AUTHENTICATION ---
-if 'auth' not in st.session_state: st.session_state.auth = False
+if 'auth' not in st.session_state: 
+    st.session_state.auth = False
+
 if not st.session_state.auth:
     st.title("🛡️ Secure Marketing Portal")
-    u, p = st.text_input("User"), st.text_input("Password", type="password")
-    if st.button("Login"):
+    st.info("💡 Login to access the dashboard. Default credentials: admin/admin123 or viewer/view123")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        u = st.text_input("Username")
+    with col2:
+        p = st.text_input("Password", type="password")
+    
+    if st.button("Login", type="primary"):
         if (u == "admin" and p == "admin123") or (u == "viewer" and p == "view123"):
-            st.session_state.auth, st.session_state.role = True, u
+            st.session_state.auth = True
+            st.session_state.role = u
+            st.success("✅ Login successful!")
             st.rerun()
+        else:
+            st.error("❌ Invalid credentials")
     st.stop()
 
-choice = st.sidebar.selectbox("Navigation", ["Dashboard", "Upload Reports", "Settings"] if st.session_state.role == "admin" else ["Dashboard"])
+# Navigation
+choice = st.sidebar.selectbox(
+    "Navigation", 
+    ["Dashboard", "Upload Reports", "Settings", "Data History"] if st.session_state.role == "admin" else ["Dashboard", "Data History"]
+)
 
 # --- 4. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
     t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
+    
     with t1:
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Channels")
+            st.subheader("📢 Channels")
             new_ch = st.text_input("Add Channel")
             if st.button("Save Channel"): 
-                c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
-                conn.commit(); st.rerun()
-            st.dataframe(pd.read_sql("SELECT name FROM channels", conn), hide_index=True)
+                try:
+                    c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
+                    conn.commit()
+                    st.success(f"✅ Channel '{new_ch}' added!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+            
+            channels_df = pd.read_sql("SELECT name FROM channels ORDER BY name", conn)
+            st.dataframe(channels_df, hide_index=True, use_container_width=True)
+            st.caption(f"Total Channels: {len(channels_df)}")
+        
         with col2:
-            st.subheader("Products")
+            st.subheader("📦 Products")
             new_pr = st.text_input("Add Product")
             if st.button("Save Product"): 
-                c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
-                conn.commit(); st.rerun()
-            st.dataframe(pd.read_sql("SELECT name FROM products", conn), hide_index=True)
+                try:
+                    c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
+                    conn.commit()
+                    st.success(f"✅ Product '{new_pr}' added!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+            
+            products_df = pd.read_sql("SELECT name FROM products ORDER BY name", conn)
+            st.dataframe(products_df, hide_index=True, use_container_width=True)
+            st.caption(f"Total Products: {len(products_df)}")
+    
     with t2:
         st.subheader("🔗 Mapping Manager")
-        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings", conn)
+        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings ORDER BY campaign", conn)
+        
+        st.caption(f"Total Mappings: {len(df_map)}")
         search = st.text_input("🔍 Search Campaign")
-        if search: df_map = df_map[df_map['campaign'].str.contains(search, case=False)]
-        for _, row in df_map.iterrows():
-            m_col1, m_col2 = st.columns([3, 1])
-            m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
-            if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
-                c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", (row['campaign'], row['product_name']))
-                conn.commit(); st.rerun()
+        
+        if search: 
+            df_map = df_map[df_map['campaign'].str.contains(search, case=False, na=False)]
+        
+        if not df_map.empty:
+            for _, row in df_map.iterrows():
+                m_col1, m_col2 = st.columns([3, 1])
+                m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
+                if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
+                    try:
+                        c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", 
+                                (row['campaign'], row['product_name']))
+                        conn.commit()
+                        st.success("✅ Mapping deleted!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+        else:
+            st.info("No mappings found")
+    
     with t3:
         st.subheader("🗑️ Delete Data")
+        st.warning("⚠️ Use with caution - this will permanently delete data!")
+        
         d_col1, d_col2 = st.columns(2)
         with d_col1:
-            chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
+            chs = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
             target_ch = st.selectbox("Channel", ["Select"] + chs)
         with d_col2:
             target_date = st.date_input("Date", value=None)
+        
         if st.button("Delete Records", type="primary"):
             if target_ch != "Select" and target_date:
                 d_str = target_date.strftime('%Y-%m-%d')
-                c.execute("DELETE FROM performance WHERE channel=? AND date=?", (target_ch, d_str))
-                conn.commit(); st.warning(f"Cleared {target_ch} for {d_str}")
+                try:
+                    result = c.execute("DELETE FROM performance WHERE channel=? AND date=?", 
+                                     (target_ch, d_str))
+                    conn.commit()
+                    st.warning(f"✅ Cleared {c.rowcount} records for {target_ch} on {d_str}")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+            else:
+                st.error("Please select both channel and date")
 
 # --- 5. UPLOAD ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
+    
+    # Check if we have master data
+    channels_count = c.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+    products_count = c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    
+    if channels_count == 0 or products_count == 0:
+        st.warning("⚠️ Please configure Channels and Products in Settings first!")
+        if st.button("Go to Settings"):
+            st.session_state.navigation = "Settings"
+            st.rerun()
+        st.stop()
+    
     u_col1, u_col2 = st.columns(2)
-    with u_col1: manual_date = st.date_input("Date Override (Optional)", value=None)
+    with u_col1: 
+        manual_date = st.date_input("Date Override (Optional)", value=None)
     with u_col2:
-        chs = [r[0] for r in c.execute("SELECT name FROM channels").fetchall()]
+        chs = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
         sel_ch = st.selectbox("Assign Channel", chs)
+    
     file = st.file_uploader("Upload File", type=['csv', 'xlsx'])
+    
     if file:
-        raw_df = robust_read_file(file)
-        if raw_df is not None:
-            df = standardize_data(raw_df, manual_date=manual_date)
-            mappings = {}
-            for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
-                mappings.setdefault(r[0], []).append(r[1])
-            unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
-            if unmapped:
-                st.warning(f"Map {len(unmapped)} new campaigns")
-                prods = [r[0] for r in c.execute("SELECT name FROM products").fetchall()] + ["Brand/Global"]
-                with st.form("map_form"):
-                    new_maps = {cp: st.multiselect(f"Map: {cp}", prods) for cp in unmapped}
-                    if st.form_submit_button("Save Mappings"):
-                        for cp, pl in new_maps.items():
-                            for pn in pl: c.execute("INSERT INTO mappings VALUES (?,?)", (cp, pn))
-                        conn.commit(); st.rerun()
+        with st.spinner("Processing file..."):
+            raw_df = robust_read_file(file)
+            
+            if raw_df is not None:
+                df = standardize_data(raw_df, manual_date=manual_date)
+                
+                st.success(f"✅ Processed {len(df)} rows")
+                st.dataframe(df.head(10), use_container_width=True)
+                
+                # Get existing mappings
+                mappings = {}
+                for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
+                    mappings.setdefault(r[0], []).append(r[1])
+                
+                unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
+                
+                if unmapped:
+                    st.warning(f"⚠️ {len(unmapped)} campaigns need mapping")
+                    prods = [r[0] for r in c.execute("SELECT name FROM products ORDER BY name").fetchall()] + ["Brand/Global"]
+                    
+                    with st.form("map_form"):
+                        st.subheader("Map Campaigns to Products")
+                        new_maps = {}
+                        for cp in unmapped:
+                            new_maps[cp] = st.multiselect(f"**{cp}**", prods, key=f"map_{cp}")
+                        
+                        if st.form_submit_button("💾 Save Mappings", type="primary"):
+                            try:
+                                for cp, pl in new_maps.items():
+                                    if pl:  # Only if products selected
+                                        for pn in pl: 
+                                            c.execute("INSERT OR IGNORE INTO mappings VALUES (?,?)", (cp, pn))
+                                conn.commit()
+                                st.success("✅ Mappings saved!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {str(e)}")
+                else:
+                    st.success("✅ All campaigns are mapped!")
+                    
+                    if st.button("🚀 Push to Dashboard", type="primary"):
+                        try:
+                            inserted = 0
+                            duplicates = 0
+                            
+                            for _, row in df.iterrows():
+                                targets = mappings.get(row['campaign'], ["Unmapped"])
+                                n = len(targets)
+                                
+                                for p_name in targets:
+                                    try:
+                                        # Use INSERT OR REPLACE to handle duplicates
+                                        c.execute("""
+                                            INSERT OR REPLACE INTO performance 
+                                            (date, channel, campaign, product, spend, sales, clicks, orders) 
+                                            VALUES (?,?,?,?,?,?,?,?)
+                                        """, (row['date'], sel_ch, row['campaign'], p_name, 
+                                             row['spend']/n, row['sales']/n, 0, 0))
+                                        inserted += 1
+                                    except sqlite3.IntegrityError:
+                                        duplicates += 1
+                            
+                            conn.commit()
+                            st.success(f"✅ Pushed {inserted} records to dashboard!")
+                            if duplicates > 0:
+                                st.info(f"ℹ️ {duplicates} duplicate records updated")
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+                            conn.rollback()
             else:
-                if st.button("🚀 Push to Dashboard"):
-                    for _, row in df.iterrows():
-                        targets = mappings.get(row['campaign'], ["Unmapped"])
-                        n = len(targets)
-                        for p_name in targets:
-                            c.execute("INSERT INTO performance VALUES (?,?,?,?,?,?,?,?)", (row['date'], sel_ch, row['campaign'], p_name, row['spend']/n, row['sales']/n, 0, 0))
-                    conn.commit(); st.success("Pushed!")
+                st.error("❌ Could not process file")
 
-# --- 6. DASHBOARD ---
-elif choice == "Dashboard":
-    st.header("📊 Performance Dashboard")
+# --- 6. DATA HISTORY ---
+elif choice == "Data History":
+    st.header("📚 Data Upload History")
+    
     df_p = pd.read_sql("SELECT * FROM performance", conn)
-    if df_p.empty: st.info("No data.")
+    
+    if df_p.empty:
+        st.info("No data uploaded yet")
     else:
         df_p['date'] = pd.to_datetime(df_p['date'])
-        st.sidebar.subheader("Filters")
-        dr = st.sidebar.date_input("Date Range", value=(df_p['date'].min().date(), df_p['date'].max().date()))
-        ch_f = st.sidebar.multiselect("Channels", df_p['channel'].unique(), default=df_p['channel'].unique())
-        pr_f = st.sidebar.multiselect("Products", df_p['product'].unique(), default=df_p['product'].unique())
-
-        if len(dr) == 2:
-            f_df = df_p[(df_p['date'] >= pd.to_datetime(dr[0])) & (df_p['date'] <= pd.to_datetime(dr[1])) & (df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
-        else: f_df = df_p[(df_p['channel'].isin(ch_f)) & (df_p['product'].isin(pr_f))]
-
-        t_spend, t_sales = f_df['spend'].sum(), f_df['sales'].sum()
-        roas = t_sales / t_spend if t_spend > 0 else 0
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Spend", f"₹{t_spend:,.0f}")
-        k2.metric("Revenue", f"₹{t_sales:,.0f}")
-        k3.metric("ROAS", f"{roas:.2f}x")
-
-        # --- MULTI-CHANNEL TREND CHART ---
-        st.subheader("Efficiency Trend by Channel")
         
-        # Aggregate data for charting
-        ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
-        ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
-        total_trend = f_df.groupby('date').agg({'spend':'sum', 'sales':'sum'}).reset_index()
-        total_trend['ROAS'] = total_trend['sales'] / total_trend['spend']
-
-        fig = go.Figure()
+        # Summary statistics
+        st.subheader("📊 Data Summary")
+        col1, col2, col3, col4 = st.columns(4)
         
-        # 1. Stacked Bars for Spend per Channel
-        for channel in ch_trend['channel'].unique():
-            ch_data = ch_trend[ch_trend['channel'] == channel]
-            fig.add_trace(go.Bar(x=ch_data['date'], y=ch_data['spend'], name=f"{channel} Spend"))
-            
-        # 2. Individual Lines for ROAS per Channel
-        for channel in ch_trend['channel'].unique():
-            ch_data = ch_trend[ch_trend['channel'] == channel]
-            fig.add_trace(go.Scatter(x=ch_data['date'], y=ch_data['ROAS'], name=f"{channel} ROAS", yaxis="y2", mode='lines+markers'))
-
-        # 3. Total ROAS Line (Dashed)
-        fig.add_trace(go.Scatter(x=total_trend['date'], y=total_trend['ROAS'], name="Total ROAS", 
-                                 yaxis="y2", line=dict(color='black', width=4, dash='dot')))
-
-        fig.update_layout(
-            barmode='stack',
-            yaxis=dict(title="Spend (₹)"),
-            yaxis2=dict(title="ROAS", overlaying="y", side="right", range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]),
-            legend=dict(orientation="h", y=1.2),
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+        with col1:
+            st.metric("Total Records", f"{len(df_p):,}")
+        with col2:
+            st.metric("Date Range", f"{df_p['date'].min().strftime('%Y-%m-%d')} to {df_p['date'].max().strftime('%Y-%m-%d')}")
+        with col3:
+            st.metric("Channels", df_p['channel'].nunique())
+        with col4:
+            st.metric("Products", df_p['product'].nunique())
+        
         st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**By Channel**")
-            st.dataframe(f_df.groupby('channel').agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
-        with c2:
-            st.write("**By Product**")
-            st.dataframe(f_df.groupby('product').agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).style.format('{:.2f}'), use_container_width=True)
         
-        st.write("**Campaign Performance**")
-        cp_tab = f_df.groupby(['channel', 'campaign']).agg({'spend':'sum', 'sales':'sum'}).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
-        st.dataframe(cp_tab.sort_values('spend', ascending=False).style.format({'spend':'₹{:.2f}', 'sales':'₹{:.2f}', 'ROAS':'{:.2f}x'}), use_container_width=True, hide_index=True)
+        # Upload history by date and channel
+        st.subheader("Upload History")
+        history = df_p.groupby(['date', 'channel']).agg({
+            'campaign': 'count',
+            'spend': 'sum',
+            'sales': 'sum'
+        }).reset_index()
+        history.columns = ['Date', 'Channel', 'Records', 'Total Spend', 'Total Sales']
+        history = history.sort_values('Date', ascending=False)
+        
+        st.dataframe(
+            history.style.format({
+                'Total Spend': '₹{:,.2f}',
+                'Total Sales': '₹{:,.2f}'
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+
+# --- 7. DASHBOARD ---
+elif choice == "Dashboard":
+    st.header("📊 Performance Dashboard")
+    
+    df_p = pd.read_sql("SELECT * FROM performance", conn)
+    
+    if df_p.empty: 
+        st.info("📭 No data available. Please upload data using 'Upload Reports'.")
+        st.stop()
+    
+    df_p['date'] = pd.to_datetime(df_p['date'])
+    
+    # Sidebar Filters
+    st.sidebar.subheader("🎯 Filters")
+    
+    # Date range filter
+    min_date = df_p['date'].min().date()
+    max_date = df_p['date'].max().date()
+    dr = st.sidebar.date_input(
+        "Date Range", 
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+    
+    # Channel filter
+    all_channels = sorted(df_p['channel'].unique().tolist())
+    ch_f = st.sidebar.multiselect(
+        "Channels", 
+        all_channels, 
+        default=all_channels
+    )
+    
+    # Product filter
+    all_products = sorted(df_p['product'].unique().tolist())
+    pr_f = st.sidebar.multiselect(
+        "Products", 
+        all_products, 
+        default=all_products
+    )
+    
+    # Apply filters
+    if len(dr) == 2:
+        f_df = df_p[
+            (df_p['date'] >= pd.to_datetime(dr[0])) & 
+            (df_p['date'] <= pd.to_datetime(dr[1])) & 
+            (df_p['channel'].isin(ch_f)) & 
+            (df_p['product'].isin(pr_f))
+        ]
+    else: 
+        f_df = df_p[
+            (df_p['channel'].isin(ch_f)) & 
+            (df_p['product'].isin(pr_f))
+        ]
+    
+    if f_df.empty:
+        st.warning("No data matches your filters")
+        st.stop()
+    
+    # Key Metrics
+    t_spend, t_sales = f_df['spend'].sum(), f_df['sales'].sum()
+    roas = t_sales / t_spend if t_spend > 0 else 0
+    
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Total Spend", f"₹{t_spend:,.0f}")
+    k2.metric("Total Revenue", f"₹{t_sales:,.0f}")
+    k3.metric("Overall ROAS", f"{roas:.2f}x")
+    
+    st.divider()
+    
+    # --- MULTI-CHANNEL TREND CHART ---
+    st.subheader("📈 Efficiency Trend by Channel")
+    
+    # Aggregate data for charting
+    ch_trend = f_df.groupby(['date', 'channel']).agg({'spend':'sum', 'sales':'sum'}).reset_index()
+    ch_trend['ROAS'] = ch_trend['sales'] / ch_trend['spend']
+    total_trend = f_df.groupby('date').agg({'spend':'sum', 'sales':'sum'}).reset_index()
+    total_trend['ROAS'] = total_trend['sales'] / total_trend['spend']
+    
+    fig = go.Figure()
+    
+    # 1. Stacked Bars for Spend per Channel
+    for channel in sorted(ch_trend['channel'].unique()):
+        ch_data = ch_trend[ch_trend['channel'] == channel]
+        fig.add_trace(go.Bar(
+            x=ch_data['date'], 
+            y=ch_data['spend'], 
+            name=f"{channel} Spend"
+        ))
+    
+    # 2. Individual Lines for ROAS per Channel
+    for channel in sorted(ch_trend['channel'].unique()):
+        ch_data = ch_trend[ch_trend['channel'] == channel]
+        fig.add_trace(go.Scatter(
+            x=ch_data['date'], 
+            y=ch_data['ROAS'], 
+            name=f"{channel} ROAS", 
+            yaxis="y2", 
+            mode='lines+markers'
+        ))
+    
+    # 3. Total ROAS Line (Dashed)
+    fig.add_trace(go.Scatter(
+        x=total_trend['date'], 
+        y=total_trend['ROAS'], 
+        name="Total ROAS", 
+        yaxis="y2", 
+        line=dict(color='black', width=4, dash='dot')
+    ))
+    
+    fig.update_layout(
+        barmode='stack',
+        yaxis=dict(title="Spend (₹)"),
+        yaxis2=dict(
+            title="ROAS", 
+            overlaying="y", 
+            side="right", 
+            range=[0, ch_trend['ROAS'].max()*1.2 if not ch_trend.empty else 10]
+        ),
+        legend=dict(orientation="h", y=1.2),
+        hovermode="x unified",
+        height=500
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.divider()
+    
+    # Summary Tables
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**Performance by Channel**")
+        channel_summary = f_df.groupby('channel').agg({
+            'spend':'sum', 
+            'sales':'sum'
+        }).assign(ROAS=lambda x: x.sales/x.spend).sort_values('spend', ascending=False)
+        
+        st.dataframe(
+            channel_summary.style.format({
+                'spend': '₹{:,.2f}',
+                'sales': '₹{:,.2f}',
+                'ROAS': '{:.2f}x'
+            }), 
+            use_container_width=True
+        )
+    
+    with c2:
+        st.write("**Performance by Product**")
+        product_summary = f_df.groupby('product').agg({
+            'spend':'sum', 
+            'sales':'sum'
+        }).assign(ROAS=lambda x: x.sales/x.spend).sort_values('spend', ascending=False)
+        
+        st.dataframe(
+            product_summary.style.format({
+                'spend': '₹{:,.2f}',
+                'sales': '₹{:,.2f}',
+                'ROAS': '{:.2f}x'
+            }), 
+            use_container_width=True
+        )
+    
+    st.divider()
+    
+    # Campaign Performance
+    st.write("**Campaign Performance**")
+    cp_tab = f_df.groupby(['channel', 'campaign']).agg({
+        'spend':'sum', 
+        'sales':'sum'
+    }).assign(ROAS=lambda x: x.sales/x.spend).reset_index()
+    
+    st.dataframe(
+        cp_tab.sort_values('spend', ascending=False).style.format({
+            'spend':'₹{:,.2f}', 
+            'sales':'₹{:,.2f}', 
+            'ROAS':'{:.2f}x'
+        }), 
+        use_container_width=True, 
+        hide_index=True,
+        height=300
+    )
+    
+    # --- DETAILED DATE-WISE DATA TABLE ---
+    st.divider()
+    st.subheader("📅 Detailed Date-wise Performance")
+    
+    # Prepare detailed table
+    detail_tab = f_df[['date', 'channel', 'product', 'campaign', 'spend', 'sales']].copy()
+    detail_tab['ROAS'] = detail_tab['sales'] / detail_tab['spend']
+    detail_tab['date'] = detail_tab['date'].dt.strftime('%Y-%m-%d')
+    
+    detail_tab = detail_tab.rename(columns={
+        'date': 'Date',
+        'channel': 'Channel',
+        'product': 'Product',
+        'campaign': 'Campaign',
+        'spend': 'Marketing Spend (₹)',
+        'sales': 'Ad Revenue (₹)',
+        'ROAS': 'ROAS'
+    })
+    detail_tab = detail_tab.sort_values('Date', ascending=False)
+    
+    # Display with formatting
+    st.dataframe(
+        detail_tab.style.format({
+            'Marketing Spend (₹)': '₹{:,.2f}',
+            'Ad Revenue (₹)': '₹{:,.2f}',
+            'ROAS': '{:.2f}x'
+        }),
+        use_container_width=True,
+        hide_index=True,
+        height=400
+    )
+    
+    st.caption(f"Total Records: {len(detail_tab):,}")
+    
+    # Download buttons
+    col_d1, col_d2, col_d3 = st.columns(3)
+    
+    with col_d1:
+        # Convert to CSV for download
+        csv_data = detail_tab.to_csv(index=False)
+        st.download_button(
+            label="📥 Download as CSV",
+            data=csv_data,
+            file_name=f"marketing_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    
+    with col_d2:
+        # Convert to Excel for download
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            detail_tab.to_excel(writer, index=False, sheet_name='Performance Data')
+            
+            # Add summary sheet
+            summary_data = pd.DataFrame({
+                'Metric': ['Total Spend', 'Total Revenue', 'Overall ROAS', 'Date Range', 'Total Records'],
+                'Value': [
+                    f"₹{t_spend:,.2f}",
+                    f"₹{t_sales:,.2f}",
+                    f"{roas:.2f}x",
+                    f"{dr[0]} to {dr[1]}" if len(dr) == 2 else "All dates",
+                    f"{len(detail_tab):,}"
+                ]
+            })
+            summary_data.to_excel(writer, index=False, sheet_name='Summary')
+        
+        excel_data = excel_buffer.getvalue()
+        st.download_button(
+            label="📥 Download as Excel",
+            data=excel_data,
+            file_name=f"marketing_performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlsheet",
+            use_container_width=True
+        )
+    
+    with col_d3:
+        # Download aggregated summary
+        summary_csv = pd.concat([
+            channel_summary.reset_index().assign(Group='Channel'),
+            product_summary.reset_index().assign(Group='Product')
+        ])
+        
+        st.download_button(
+            label="📥 Download Summary",
+            data=summary_csv.to_csv(index=False),
+            file_name=f"marketing_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+# Footer
+st.sidebar.divider()
+st.sidebar.caption(f"Logged in as: **{st.session_state.role}**")
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.auth = False
+    st.rerun()
+
+# Database info
+st.sidebar.divider()
+st.sidebar.caption(f"Database: {DB_PATH}")
+if os.path.exists(DB_PATH):
+    db_size = os.path.getsize(DB_PATH) / 1024  # KB
+    st.sidebar.caption(f"Size: {db_size:.2f} KB")
