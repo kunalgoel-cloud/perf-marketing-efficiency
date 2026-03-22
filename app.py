@@ -1,145 +1,110 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 import io
 import plotly.graph_objects as go
 from datetime import datetime
-import os
-from pathlib import Path
+from supabase import create_client, Client
+import json
 
-# --- 1. PERSISTENT DATABASE CONFIGURATION ---
-# Use a persistent directory that survives restarts
-# For Streamlit Cloud, we'll use the working directory
-# For local development, create a data directory
+# --- 1. SUPABASE CONFIGURATION ---
+# Store these in Streamlit secrets (.streamlit/secrets.toml)
+# For local development, create .streamlit/secrets.toml with:
+# SUPABASE_URL = "your-project-url"
+# SUPABASE_KEY = "your-anon-key"
 
-def get_database_path():
-    """Get the database path - ensures it's in a persistent location"""
-    # Try to use a data directory if it exists, otherwise use current directory
-    data_dir = Path("./data")
-    if not data_dir.exists():
-        try:
-            data_dir.mkdir(parents=True, exist_ok=True)
-        except:
-            # If we can't create data dir, use current directory
-            return "marketing_v10_final.db"
-    
-    return str(data_dir / "marketing_v10_final.db")
-
-DB_PATH = get_database_path()
-
-# Store database path in session state to track it
-if 'db_path' not in st.session_state:
-    st.session_state.db_path = DB_PATH
-
-def get_db_connection():
-    """Create a database connection with proper settings"""
-    conn = sqlite3.connect(
-        st.session_state.db_path, 
-        check_same_thread=False, 
-        timeout=30.0,
-        isolation_level=None  # Autocommit mode for immediate persistence
-    )
-    # Enable WAL mode for better concurrent access
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')  # Faster writes
-    conn.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp storage
-    return conn
-
-def init_database():
-    """Initialize database tables - preserves existing data"""
-    conn = get_db_connection()
-    c = conn.cursor()
-    
-    # Create tables with IF NOT EXISTS
-    c.execute('''CREATE TABLE IF NOT EXISTS products (
-        name TEXT UNIQUE PRIMARY KEY
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS channels (
-        name TEXT UNIQUE PRIMARY KEY
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS mappings (
-        campaign TEXT,
-        product_name TEXT,
-        UNIQUE(campaign, product_name)
-    )''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS performance (
-        date TEXT NOT NULL,
-        channel TEXT NOT NULL,
-        campaign TEXT NOT NULL,
-        product TEXT NOT NULL,
-        spend REAL DEFAULT 0,
-        sales REAL DEFAULT 0,
-        clicks REAL DEFAULT 0,
-        orders REAL DEFAULT 0
-    )''')
-    
-    # Create indexes
-    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_date ON performance(date)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_channel ON performance(channel)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_product ON performance(product)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_composite ON performance(date, channel, product)')
-    
-    conn.commit()
-    conn.close()
-
-# Initialize database
-init_database()
-
-# Create persistent connection using session state instead of cache
-if 'db_conn' not in st.session_state:
-    st.session_state.db_conn = get_db_connection()
-
-conn = st.session_state.db_conn
-c = conn.cursor()
-
-# --- 2. BACKUP AND RESTORE FUNCTIONS ---
-def create_backup():
-    """Create a backup of the database"""
+def get_supabase_client() -> Client:
+    """Initialize Supabase client"""
     try:
-        backup_dir = Path("./backups")
-        backup_dir.mkdir(exist_ok=True)
-        
-        backup_path = backup_dir / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        
-        # Create backup connection
-        backup_conn = sqlite3.connect(str(backup_path))
-        
-        # Copy database
-        with backup_conn:
-            conn.backup(backup_conn)
-        
-        backup_conn.close()
-        return str(backup_path)
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
     except Exception as e:
-        st.error(f"Backup failed: {str(e)}")
-        return None
+        st.error(f"⚠️ Supabase connection error: {str(e)}")
+        st.info("Please configure SUPABASE_URL and SUPABASE_KEY in Streamlit secrets")
+        st.stop()
 
-def export_all_data_to_csv():
-    """Export all database tables to CSV for backup"""
+# Initialize Supabase client
+if 'supabase' not in st.session_state:
+    st.session_state.supabase = get_supabase_client()
+
+supabase = st.session_state.supabase
+
+# --- 2. DATABASE HELPER FUNCTIONS ---
+def init_supabase_tables():
+    """Check if tables exist and provide setup instructions"""
     try:
-        # Create export directory
-        export_dir = Path("./exports")
-        export_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Export each table
-        tables = ['products', 'channels', 'mappings', 'performance']
-        export_files = {}
-        
-        for table in tables:
-            df = pd.read_sql(f"SELECT * FROM {table}", conn)
-            filepath = export_dir / f"{table}_{timestamp}.csv"
-            df.to_csv(filepath, index=False)
-            export_files[table] = str(filepath)
-        
-        return export_files
+        # Test connection by trying to read from products table
+        supabase.table('products').select("*").limit(1).execute()
+        return True
     except Exception as e:
-        st.error(f"Export failed: {str(e)}")
-        return None
+        st.error("⚠️ Database tables not set up yet!")
+        st.info("Please run the SQL setup script in your Supabase dashboard")
+        
+        with st.expander("📋 Click to see SQL Setup Script"):
+            st.code("""
+-- Run this SQL in your Supabase SQL Editor
+
+-- 1. Products table
+CREATE TABLE IF NOT EXISTS products (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 2. Channels table
+CREATE TABLE IF NOT EXISTS channels (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- 3. Mappings table
+CREATE TABLE IF NOT EXISTS mappings (
+    id BIGSERIAL PRIMARY KEY,
+    campaign TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(campaign, product_name)
+);
+
+-- 4. Performance table
+CREATE TABLE IF NOT EXISTS performance (
+    id BIGSERIAL PRIMARY KEY,
+    date TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    campaign TEXT NOT NULL,
+    product TEXT NOT NULL,
+    spend REAL DEFAULT 0,
+    sales REAL DEFAULT 0,
+    clicks REAL DEFAULT 0,
+    orders REAL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(date, channel, campaign, product)
+);
+
+-- Create indexes for better performance
+CREATE INDEX IF NOT EXISTS idx_performance_date ON performance(date);
+CREATE INDEX IF NOT EXISTS idx_performance_channel ON performance(channel);
+CREATE INDEX IF NOT EXISTS idx_performance_product ON performance(product);
+CREATE INDEX IF NOT EXISTS idx_performance_composite ON performance(date, channel, product);
+
+-- Enable Row Level Security (RLS) - Optional but recommended
+ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE channels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE mappings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE performance ENABLE ROW LEVEL SECURITY;
+
+-- Create policies to allow all operations (adjust based on your security needs)
+CREATE POLICY "Enable all for products" ON products FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Enable all for channels" ON channels FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Enable all for mappings" ON mappings FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "Enable all for performance" ON performance FOR ALL USING (true) WITH CHECK (true);
+            """, language="sql")
+        
+        st.stop()
+
+# Initialize tables
+init_supabase_tables()
 
 # --- 3. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
@@ -195,7 +160,115 @@ def standardize_data(df, manual_date=None):
     
     return df[['date', 'campaign', 'spend', 'sales']]
 
-# --- 4. AUTHENTICATION ---
+# --- 4. SUPABASE CRUD OPERATIONS ---
+def get_all_products():
+    """Get all products from Supabase"""
+    try:
+        response = supabase.table('products').select('name').order('name').execute()
+        return [item['name'] for item in response.data]
+    except:
+        return []
+
+def get_all_channels():
+    """Get all channels from Supabase"""
+    try:
+        response = supabase.table('channels').select('name').order('name').execute()
+        return [item['name'] for item in response.data]
+    except:
+        return []
+
+def add_product(name):
+    """Add a new product"""
+    try:
+        supabase.table('products').insert({'name': name}).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error adding product: {str(e)}")
+        return False
+
+def add_channel(name):
+    """Add a new channel"""
+    try:
+        supabase.table('channels').insert({'name': name}).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error adding channel: {str(e)}")
+        return False
+
+def get_all_mappings():
+    """Get all campaign-product mappings"""
+    try:
+        response = supabase.table('mappings').select('campaign, product_name').order('campaign').execute()
+        return pd.DataFrame(response.data)
+    except:
+        return pd.DataFrame(columns=['campaign', 'product_name'])
+
+def add_mapping(campaign, product_name):
+    """Add campaign-product mapping"""
+    try:
+        supabase.table('mappings').insert({
+            'campaign': campaign,
+            'product_name': product_name
+        }).execute()
+        return True
+    except:
+        return False
+
+def delete_mapping(campaign, product_name):
+    """Delete a mapping"""
+    try:
+        supabase.table('mappings').delete().eq('campaign', campaign).eq('product_name', product_name).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting mapping: {str(e)}")
+        return False
+
+def get_all_performance():
+    """Get all performance data"""
+    try:
+        response = supabase.table('performance').select('*').execute()
+        return pd.DataFrame(response.data)
+    except:
+        return pd.DataFrame()
+
+def add_performance_record(date, channel, campaign, product, spend, sales):
+    """Add or update performance record"""
+    try:
+        # Check if record exists
+        existing = supabase.table('performance').select('id').eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
+        
+        record = {
+            'date': date,
+            'channel': channel,
+            'campaign': campaign,
+            'product': product,
+            'spend': spend,
+            'sales': sales,
+            'clicks': 0,
+            'orders': 0
+        }
+        
+        if existing.data:
+            # Update existing record
+            supabase.table('performance').update(record).eq('id', existing.data[0]['id']).execute()
+        else:
+            # Insert new record
+            supabase.table('performance').insert(record).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error saving performance: {str(e)}")
+        return False
+
+def delete_performance_records(channel, date):
+    """Delete performance records for a channel and date"""
+    try:
+        result = supabase.table('performance').delete().eq('channel', channel).eq('date', date).execute()
+        return len(result.data) if result.data else 0
+    except Exception as e:
+        st.error(f"Error deleting records: {str(e)}")
+        return 0
+
+# --- 5. AUTHENTICATION ---
 if 'auth' not in st.session_state: 
     st.session_state.auth = False
 
@@ -222,10 +295,10 @@ if not st.session_state.auth:
 # Navigation
 choice = st.sidebar.selectbox(
     "Navigation", 
-    ["Dashboard", "Upload Reports", "Settings", "Data History", "Backup & Restore"] if st.session_state.role == "admin" else ["Dashboard", "Data History"]
+    ["Dashboard", "Upload Reports", "Settings", "Data History"] if st.session_state.role == "admin" else ["Dashboard", "Data History"]
 )
 
-# --- 5. SETTINGS ---
+# --- 6. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
     t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
@@ -237,62 +310,55 @@ if choice == "Settings":
             new_ch = st.text_input("Add Channel")
             if st.button("Save Channel"): 
                 if new_ch:
-                    try:
-                        c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
-                        conn.commit()
+                    if add_channel(new_ch):
                         st.success(f"✅ Channel '{new_ch}' added!")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
                 else:
                     st.warning("Please enter a channel name")
             
-            channels_df = pd.read_sql("SELECT name FROM channels ORDER BY name", conn)
-            st.dataframe(channels_df, hide_index=True, use_container_width=True, height=300)
-            st.caption(f"Total Channels: {len(channels_df)}")
+            channels = get_all_channels()
+            if channels:
+                st.dataframe(pd.DataFrame({'name': channels}), hide_index=True, use_container_width=True, height=300)
+                st.caption(f"Total Channels: {len(channels)}")
+            else:
+                st.info("No channels yet")
         
         with col2:
             st.subheader("📦 Products")
             new_pr = st.text_input("Add Product")
             if st.button("Save Product"): 
                 if new_pr:
-                    try:
-                        c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
-                        conn.commit()
+                    if add_product(new_pr):
                         st.success(f"✅ Product '{new_pr}' added!")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
                 else:
                     st.warning("Please enter a product name")
             
-            products_df = pd.read_sql("SELECT name FROM products ORDER BY name", conn)
-            st.dataframe(products_df, hide_index=True, use_container_width=True, height=300)
-            st.caption(f"Total Products: {len(products_df)}")
+            products = get_all_products()
+            if products:
+                st.dataframe(pd.DataFrame({'name': products}), hide_index=True, use_container_width=True, height=300)
+                st.caption(f"Total Products: {len(products)}")
+            else:
+                st.info("No products yet")
     
     with t2:
         st.subheader("🔗 Mapping Manager")
-        df_map = pd.read_sql("SELECT campaign, product_name FROM mappings ORDER BY campaign", conn)
-        
-        st.caption(f"Total Mappings: {len(df_map)}")
-        search = st.text_input("🔍 Search Campaign")
-        
-        if search: 
-            df_map = df_map[df_map['campaign'].str.contains(search, case=False, na=False)]
+        df_map = get_all_mappings()
         
         if not df_map.empty:
+            st.caption(f"Total Mappings: {len(df_map)}")
+            search = st.text_input("🔍 Search Campaign")
+            
+            if search: 
+                df_map = df_map[df_map['campaign'].str.contains(search, case=False, na=False)]
+            
             for idx, row in df_map.iterrows():
                 m_col1, m_col2 = st.columns([3, 1])
                 m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
                 if m_col2.button("Delete", key=f"del_{idx}"):
-                    try:
-                        c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", 
-                                (row['campaign'], row['product_name']))
-                        conn.commit()
+                    if delete_mapping(row['campaign'], row['product_name']):
                         st.success("✅ Mapping deleted!")
                         st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
         else:
             st.info("No mappings found")
     
@@ -302,83 +368,28 @@ if choice == "Settings":
         
         d_col1, d_col2 = st.columns(2)
         with d_col1:
-            channels_list = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
-            target_ch = st.selectbox("Channel", ["Select"] + channels_list)
+            channels = get_all_channels()
+            target_ch = st.selectbox("Channel", ["Select"] + channels)
         with d_col2:
             target_date = st.date_input("Date", value=None)
         
         if st.button("Delete Records", type="primary"):
             if target_ch != "Select" and target_date:
                 d_str = target_date.strftime('%Y-%m-%d')
-                try:
-                    c.execute("DELETE FROM performance WHERE channel=? AND date=?", 
-                            (target_ch, d_str))
-                    deleted_count = c.rowcount
-                    conn.commit()
-                    st.warning(f"✅ Deleted {deleted_count} records for {target_ch} on {d_str}")
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                deleted = delete_performance_records(target_ch, d_str)
+                st.warning(f"✅ Deleted {deleted} records for {target_ch} on {d_str}")
             else:
                 st.error("Please select both channel and date")
-
-# --- 6. BACKUP & RESTORE ---
-elif choice == "Backup & Restore":
-    st.header("💾 Backup & Restore")
-    
-    tab1, tab2 = st.tabs(["Create Backup", "Export Data"])
-    
-    with tab1:
-        st.subheader("Create Database Backup")
-        st.info("Create a backup copy of your entire database")
-        
-        if st.button("📦 Create Backup Now", type="primary"):
-            with st.spinner("Creating backup..."):
-                backup_path = create_backup()
-                if backup_path:
-                    st.success(f"✅ Backup created: {backup_path}")
-                    
-                    # Offer download
-                    with open(backup_path, 'rb') as f:
-                        st.download_button(
-                            label="📥 Download Backup File",
-                            data=f.read(),
-                            file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
-                            mime="application/x-sqlite3"
-                        )
-    
-    with tab2:
-        st.subheader("Export All Data to CSV")
-        st.info("Export all tables to CSV format for external analysis or backup")
-        
-        if st.button("📊 Export All Tables", type="primary"):
-            with st.spinner("Exporting data..."):
-                export_files = export_all_data_to_csv()
-                if export_files:
-                    st.success("✅ Data exported successfully!")
-                    
-                    # Create a zip file with all exports
-                    import zipfile
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                        for table, filepath in export_files.items():
-                            zip_file.write(filepath, os.path.basename(filepath))
-                    
-                    st.download_button(
-                        label="📥 Download All Exports (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name=f"data_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                        mime="application/zip"
-                    )
 
 # --- 7. UPLOAD ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     
     # Check if we have master data
-    channels_count = c.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
-    products_count = c.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    channels = get_all_channels()
+    products = get_all_products()
     
-    if channels_count == 0 or products_count == 0:
+    if not channels or not products:
         st.warning("⚠️ Please configure Channels and Products in Settings first!")
         if st.button("Go to Settings"):
             st.rerun()
@@ -388,8 +399,7 @@ elif choice == "Upload Reports":
     with u_col1: 
         manual_date = st.date_input("Date Override (Optional)", value=None)
     with u_col2:
-        channels_list = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
-        sel_ch = st.selectbox("Assign Channel", channels_list)
+        sel_ch = st.selectbox("Assign Channel", channels)
     
     file = st.file_uploader("Upload File", type=['csv', 'xlsx'])
     
@@ -404,15 +414,19 @@ elif choice == "Upload Reports":
                 st.dataframe(df.head(10), use_container_width=True)
                 
                 # Get existing mappings
+                df_map = get_all_mappings()
                 mappings = {}
-                for r in c.execute("SELECT campaign, product_name FROM mappings").fetchall():
-                    mappings.setdefault(r[0], []).append(r[1])
+                if not df_map.empty:
+                    for _, row in df_map.iterrows():
+                        if row['campaign'] not in mappings:
+                            mappings[row['campaign']] = []
+                        mappings[row['campaign']].append(row['product_name'])
                 
                 unmapped = [cp for cp in df['campaign'].unique() if cp not in mappings]
                 
                 if unmapped:
                     st.warning(f"⚠️ {len(unmapped)} campaigns need mapping")
-                    prods = [r[0] for r in c.execute("SELECT name FROM products ORDER BY name").fetchall()] + ["Brand/Global"]
+                    prods = products + ["Brand/Global"]
                     
                     with st.form("map_form"):
                         st.subheader("Map Campaigns to Products")
@@ -421,47 +435,39 @@ elif choice == "Upload Reports":
                             new_maps[cp] = st.multiselect(f"**{cp}**", prods, key=f"map_{cp}")
                         
                         if st.form_submit_button("💾 Save Mappings", type="primary"):
-                            try:
-                                for cp, pl in new_maps.items():
-                                    if pl:
-                                        for pn in pl: 
-                                            c.execute("INSERT OR IGNORE INTO mappings VALUES (?,?)", (cp, pn))
-                                conn.commit()
-                                st.success("✅ Mappings saved!")
+                            success_count = 0
+                            for cp, pl in new_maps.items():
+                                if pl:
+                                    for pn in pl: 
+                                        if add_mapping(cp, pn):
+                                            success_count += 1
+                            if success_count > 0:
+                                st.success(f"✅ {success_count} mappings saved!")
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"Error: {str(e)}")
                 else:
                     st.success("✅ All campaigns are mapped!")
                     
                     if st.button("🚀 Push to Dashboard", type="primary"):
-                        try:
+                        with st.spinner("Uploading to Supabase..."):
                             inserted = 0
+                            errors = 0
                             
                             for _, row in df.iterrows():
                                 targets = mappings.get(row['campaign'], ["Unmapped"])
                                 n = len(targets)
                                 
                                 for p_name in targets:
-                                    c.execute("""
-                                        INSERT OR REPLACE INTO performance 
-                                        (date, channel, campaign, product, spend, sales, clicks, orders) 
-                                        VALUES (?,?,?,?,?,?,?,?)
-                                    """, (row['date'], sel_ch, row['campaign'], p_name, 
-                                         row['spend']/n, row['sales']/n, 0, 0))
-                                    inserted += 1
+                                    if add_performance_record(
+                                        row['date'], sel_ch, row['campaign'], p_name,
+                                        float(row['spend']/n), float(row['sales']/n)
+                                    ):
+                                        inserted += 1
+                                    else:
+                                        errors += 1
                             
-                            conn.commit()
-                            st.success(f"✅ Successfully pushed {inserted} records to dashboard!")
-                            
-                            # Auto-create backup after successful upload
-                            with st.spinner("Creating automatic backup..."):
-                                create_backup()
-                                st.info("💾 Automatic backup created")
-                            
-                        except Exception as e:
-                            st.error(f"Error: {str(e)}")
-                            conn.rollback()
+                            st.success(f"✅ Successfully pushed {inserted} records to Supabase!")
+                            if errors > 0:
+                                st.warning(f"⚠️ {errors} records had errors")
             else:
                 st.error("❌ Could not process file")
 
@@ -469,11 +475,13 @@ elif choice == "Upload Reports":
 elif choice == "Data History":
     st.header("📚 Data Upload History")
     
-    df_p = pd.read_sql("SELECT * FROM performance", conn)
+    df_p = get_all_performance()
     
     if df_p.empty:
         st.info("No data uploaded yet")
     else:
+        # Drop id and created_at columns if they exist
+        df_p = df_p.drop(columns=['id', 'created_at'], errors='ignore')
         df_p['date'] = pd.to_datetime(df_p['date'])
         
         # Summary statistics
@@ -514,12 +522,14 @@ elif choice == "Data History":
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
     
-    df_p = pd.read_sql("SELECT * FROM performance", conn)
+    df_p = get_all_performance()
     
     if df_p.empty: 
         st.info("📭 No data available. Please upload data using 'Upload Reports'.")
         st.stop()
     
+    # Drop id and created_at columns
+    df_p = df_p.drop(columns=['id', 'created_at'], errors='ignore')
     df_p['date'] = pd.to_datetime(df_p['date'])
     
     # Sidebar Filters
@@ -791,14 +801,9 @@ if st.sidebar.button("🚪 Logout"):
 
 # Database info
 st.sidebar.divider()
-st.sidebar.caption(f"💾 Database: `{st.session_state.db_path}`")
-if os.path.exists(st.session_state.db_path):
-    db_size = os.path.getsize(st.session_state.db_path) / 1024  # KB
-    st.sidebar.caption(f"📊 Size: {db_size:.2f} KB")
-    
-    # Show record counts
-    try:
-        perf_count = c.execute("SELECT COUNT(*) FROM performance").fetchone()[0]
-        st.sidebar.caption(f"📈 Records: {perf_count:,}")
-    except:
-        pass
+st.sidebar.success("☁️ Connected to Supabase")
+try:
+    perf_count = len(get_all_performance())
+    st.sidebar.caption(f"📈 Total Records: {perf_count:,}")
+except:
+    pass
