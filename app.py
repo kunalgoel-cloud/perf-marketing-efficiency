@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS mappings (
     campaign TEXT NOT NULL,
     product_name TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(campaign, product_name)
+    CONSTRAINT mappings_unique UNIQUE(campaign, product_name)
 );
 
 -- 4. Performance table
@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS performance (
     clicks REAL DEFAULT 0,
     orders REAL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(date, channel, campaign, product)
+    CONSTRAINT performance_unique UNIQUE(date, channel, campaign, product)
 );
 
 -- Create indexes for better performance
@@ -232,32 +232,46 @@ def get_all_performance():
         return pd.DataFrame()
 
 def add_performance_record(date, channel, campaign, product, spend, sales):
-    """Add or update performance record"""
+    """Add or update performance record using upsert"""
     try:
-        # Check if record exists
-        existing = supabase.table('performance').select('id').eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
-        
         record = {
             'date': date,
             'channel': channel,
             'campaign': campaign,
             'product': product,
-            'spend': spend,
-            'sales': sales,
+            'spend': float(spend),
+            'sales': float(sales),
             'clicks': 0,
             'orders': 0
         }
         
-        if existing.data:
-            # Update existing record
-            supabase.table('performance').update(record).eq('id', existing.data[0]['id']).execute()
-        else:
-            # Insert new record
-            supabase.table('performance').insert(record).execute()
+        # Use upsert to insert or update based on unique constraint
+        # onConflict parameter tells Supabase which columns form the unique constraint
+        supabase.table('performance').upsert(
+            record,
+            on_conflict='date,channel,campaign,product'
+        ).execute()
+        
         return True
     except Exception as e:
-        st.error(f"Error saving performance: {str(e)}")
-        return False
+        # If upsert doesn't work, try manual check
+        try:
+            # Check if record exists
+            existing = supabase.table('performance').select('*').eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
+            
+            if existing.data and len(existing.data) > 0:
+                # Update existing record - use the unique fields to identify it
+                supabase.table('performance').update({
+                    'spend': float(spend),
+                    'sales': float(sales)
+                }).eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
+            else:
+                # Insert new record
+                supabase.table('performance').insert(record).execute()
+            return True
+        except Exception as e2:
+            st.error(f"Error saving performance: {str(e2)}")
+            return False
 
 def delete_performance_records(channel, date):
     """Delete performance records for a channel and date"""
