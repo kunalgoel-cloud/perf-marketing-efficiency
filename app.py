@@ -5,24 +5,52 @@ import io
 import plotly.graph_objects as go
 from datetime import datetime
 import os
+from pathlib import Path
 
-# --- 1. IMPROVED DATABASE SETUP WITH PERSISTENCE ---
-# Using the SAME database file to preserve existing data
-DB_PATH = 'marketing_v10_final.db'
+# --- 1. PERSISTENT DATABASE CONFIGURATION ---
+# Use a persistent directory that survives restarts
+# For Streamlit Cloud, we'll use the working directory
+# For local development, create a data directory
+
+def get_database_path():
+    """Get the database path - ensures it's in a persistent location"""
+    # Try to use a data directory if it exists, otherwise use current directory
+    data_dir = Path("./data")
+    if not data_dir.exists():
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+        except:
+            # If we can't create data dir, use current directory
+            return "marketing_v10_final.db"
+    
+    return str(data_dir / "marketing_v10_final.db")
+
+DB_PATH = get_database_path()
+
+# Store database path in session state to track it
+if 'db_path' not in st.session_state:
+    st.session_state.db_path = DB_PATH
 
 def get_db_connection():
-    """Create a database connection"""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+    """Create a database connection with proper settings"""
+    conn = sqlite3.connect(
+        st.session_state.db_path, 
+        check_same_thread=False, 
+        timeout=30.0,
+        isolation_level=None  # Autocommit mode for immediate persistence
+    )
     # Enable WAL mode for better concurrent access
     conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')  # Faster writes
+    conn.execute('PRAGMA temp_store=MEMORY')  # Use memory for temp storage
     return conn
 
 def init_database():
-    """Initialize database tables ONLY if they don't exist - preserves existing data"""
+    """Initialize database tables - preserves existing data"""
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Create tables ONLY if they don't exist (IF NOT EXISTS ensures no data loss)
+    # Create tables with IF NOT EXISTS
     c.execute('''CREATE TABLE IF NOT EXISTS products (
         name TEXT UNIQUE PRIMARY KEY
     )''')
@@ -48,27 +76,72 @@ def init_database():
         orders REAL DEFAULT 0
     )''')
     
-    # Create indexes for better query performance (IF NOT EXISTS prevents errors)
+    # Create indexes
     c.execute('CREATE INDEX IF NOT EXISTS idx_performance_date ON performance(date)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_performance_channel ON performance(channel)')
     c.execute('CREATE INDEX IF NOT EXISTS idx_performance_product ON performance(product)')
+    c.execute('CREATE INDEX IF NOT EXISTS idx_performance_composite ON performance(date, channel, product)')
     
     conn.commit()
     conn.close()
 
-# Initialize database on app start (preserves existing data)
+# Initialize database
 init_database()
 
-# Create a persistent connection
-@st.cache_resource
-def get_persistent_connection():
-    """Cache the database connection across reruns"""
-    return get_db_connection()
+# Create persistent connection using session state instead of cache
+if 'db_conn' not in st.session_state:
+    st.session_state.db_conn = get_db_connection()
 
-conn = get_persistent_connection()
+conn = st.session_state.db_conn
 c = conn.cursor()
 
-# --- 2. DATA PROCESSING ENGINE ---
+# --- 2. BACKUP AND RESTORE FUNCTIONS ---
+def create_backup():
+    """Create a backup of the database"""
+    try:
+        backup_dir = Path("./backups")
+        backup_dir.mkdir(exist_ok=True)
+        
+        backup_path = backup_dir / f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        
+        # Create backup connection
+        backup_conn = sqlite3.connect(str(backup_path))
+        
+        # Copy database
+        with backup_conn:
+            conn.backup(backup_conn)
+        
+        backup_conn.close()
+        return str(backup_path)
+    except Exception as e:
+        st.error(f"Backup failed: {str(e)}")
+        return None
+
+def export_all_data_to_csv():
+    """Export all database tables to CSV for backup"""
+    try:
+        # Create export directory
+        export_dir = Path("./exports")
+        export_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        # Export each table
+        tables = ['products', 'channels', 'mappings', 'performance']
+        export_files = {}
+        
+        for table in tables:
+            df = pd.read_sql(f"SELECT * FROM {table}", conn)
+            filepath = export_dir / f"{table}_{timestamp}.csv"
+            df.to_csv(filepath, index=False)
+            export_files[table] = str(filepath)
+        
+        return export_files
+    except Exception as e:
+        st.error(f"Export failed: {str(e)}")
+        return None
+
+# --- 3. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
     """Read CSV or Excel files with multiple encoding attempts"""
     file_name = file.name.lower()
@@ -122,7 +195,7 @@ def standardize_data(df, manual_date=None):
     
     return df[['date', 'campaign', 'spend', 'sales']]
 
-# --- 3. AUTHENTICATION ---
+# --- 4. AUTHENTICATION ---
 if 'auth' not in st.session_state: 
     st.session_state.auth = False
 
@@ -149,10 +222,10 @@ if not st.session_state.auth:
 # Navigation
 choice = st.sidebar.selectbox(
     "Navigation", 
-    ["Dashboard", "Upload Reports", "Settings", "Data History"] if st.session_state.role == "admin" else ["Dashboard", "Data History"]
+    ["Dashboard", "Upload Reports", "Settings", "Data History", "Backup & Restore"] if st.session_state.role == "admin" else ["Dashboard", "Data History"]
 )
 
-# --- 4. SETTINGS ---
+# --- 5. SETTINGS ---
 if choice == "Settings":
     st.header("⚙️ System Management")
     t1, t2, t3 = st.tabs(["Master Data", "Mapping Manager", "Data Cleanup"])
@@ -163,32 +236,38 @@ if choice == "Settings":
             st.subheader("📢 Channels")
             new_ch = st.text_input("Add Channel")
             if st.button("Save Channel"): 
-                try:
-                    c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
-                    conn.commit()
-                    st.success(f"✅ Channel '{new_ch}' added!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                if new_ch:
+                    try:
+                        c.execute("INSERT OR IGNORE INTO channels VALUES (?)", (new_ch,))
+                        conn.commit()
+                        st.success(f"✅ Channel '{new_ch}' added!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+                else:
+                    st.warning("Please enter a channel name")
             
             channels_df = pd.read_sql("SELECT name FROM channels ORDER BY name", conn)
-            st.dataframe(channels_df, hide_index=True, use_container_width=True)
+            st.dataframe(channels_df, hide_index=True, use_container_width=True, height=300)
             st.caption(f"Total Channels: {len(channels_df)}")
         
         with col2:
             st.subheader("📦 Products")
             new_pr = st.text_input("Add Product")
             if st.button("Save Product"): 
-                try:
-                    c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
-                    conn.commit()
-                    st.success(f"✅ Product '{new_pr}' added!")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                if new_pr:
+                    try:
+                        c.execute("INSERT OR IGNORE INTO products VALUES (?)", (new_pr,))
+                        conn.commit()
+                        st.success(f"✅ Product '{new_pr}' added!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+                else:
+                    st.warning("Please enter a product name")
             
             products_df = pd.read_sql("SELECT name FROM products ORDER BY name", conn)
-            st.dataframe(products_df, hide_index=True, use_container_width=True)
+            st.dataframe(products_df, hide_index=True, use_container_width=True, height=300)
             st.caption(f"Total Products: {len(products_df)}")
     
     with t2:
@@ -202,10 +281,10 @@ if choice == "Settings":
             df_map = df_map[df_map['campaign'].str.contains(search, case=False, na=False)]
         
         if not df_map.empty:
-            for _, row in df_map.iterrows():
+            for idx, row in df_map.iterrows():
                 m_col1, m_col2 = st.columns([3, 1])
                 m_col1.write(f"**{row['campaign']}** → {row['product_name']}")
-                if m_col2.button("Delete", key=f"del_{row['campaign']}_{row['product_name']}"):
+                if m_col2.button("Delete", key=f"del_{idx}"):
                     try:
                         c.execute("DELETE FROM mappings WHERE campaign=? AND product_name=?", 
                                 (row['campaign'], row['product_name']))
@@ -223,8 +302,8 @@ if choice == "Settings":
         
         d_col1, d_col2 = st.columns(2)
         with d_col1:
-            chs = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
-            target_ch = st.selectbox("Channel", ["Select"] + chs)
+            channels_list = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
+            target_ch = st.selectbox("Channel", ["Select"] + channels_list)
         with d_col2:
             target_date = st.date_input("Date", value=None)
         
@@ -232,16 +311,66 @@ if choice == "Settings":
             if target_ch != "Select" and target_date:
                 d_str = target_date.strftime('%Y-%m-%d')
                 try:
-                    result = c.execute("DELETE FROM performance WHERE channel=? AND date=?", 
-                                     (target_ch, d_str))
+                    c.execute("DELETE FROM performance WHERE channel=? AND date=?", 
+                            (target_ch, d_str))
+                    deleted_count = c.rowcount
                     conn.commit()
-                    st.warning(f"✅ Cleared {c.rowcount} records for {target_ch} on {d_str}")
+                    st.warning(f"✅ Deleted {deleted_count} records for {target_ch} on {d_str}")
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
             else:
                 st.error("Please select both channel and date")
 
-# --- 5. UPLOAD ---
+# --- 6. BACKUP & RESTORE ---
+elif choice == "Backup & Restore":
+    st.header("💾 Backup & Restore")
+    
+    tab1, tab2 = st.tabs(["Create Backup", "Export Data"])
+    
+    with tab1:
+        st.subheader("Create Database Backup")
+        st.info("Create a backup copy of your entire database")
+        
+        if st.button("📦 Create Backup Now", type="primary"):
+            with st.spinner("Creating backup..."):
+                backup_path = create_backup()
+                if backup_path:
+                    st.success(f"✅ Backup created: {backup_path}")
+                    
+                    # Offer download
+                    with open(backup_path, 'rb') as f:
+                        st.download_button(
+                            label="📥 Download Backup File",
+                            data=f.read(),
+                            file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                            mime="application/x-sqlite3"
+                        )
+    
+    with tab2:
+        st.subheader("Export All Data to CSV")
+        st.info("Export all tables to CSV format for external analysis or backup")
+        
+        if st.button("📊 Export All Tables", type="primary"):
+            with st.spinner("Exporting data..."):
+                export_files = export_all_data_to_csv()
+                if export_files:
+                    st.success("✅ Data exported successfully!")
+                    
+                    # Create a zip file with all exports
+                    import zipfile
+                    zip_buffer = io.BytesIO()
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                        for table, filepath in export_files.items():
+                            zip_file.write(filepath, os.path.basename(filepath))
+                    
+                    st.download_button(
+                        label="📥 Download All Exports (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name=f"data_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip"
+                    )
+
+# --- 7. UPLOAD ---
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     
@@ -252,7 +381,6 @@ elif choice == "Upload Reports":
     if channels_count == 0 or products_count == 0:
         st.warning("⚠️ Please configure Channels and Products in Settings first!")
         if st.button("Go to Settings"):
-            st.session_state.navigation = "Settings"
             st.rerun()
         st.stop()
     
@@ -260,8 +388,8 @@ elif choice == "Upload Reports":
     with u_col1: 
         manual_date = st.date_input("Date Override (Optional)", value=None)
     with u_col2:
-        chs = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
-        sel_ch = st.selectbox("Assign Channel", chs)
+        channels_list = [r[0] for r in c.execute("SELECT name FROM channels ORDER BY name").fetchall()]
+        sel_ch = st.selectbox("Assign Channel", channels_list)
     
     file = st.file_uploader("Upload File", type=['csv', 'xlsx'])
     
@@ -295,7 +423,7 @@ elif choice == "Upload Reports":
                         if st.form_submit_button("💾 Save Mappings", type="primary"):
                             try:
                                 for cp, pl in new_maps.items():
-                                    if pl:  # Only if products selected
+                                    if pl:
                                         for pn in pl: 
                                             c.execute("INSERT OR IGNORE INTO mappings VALUES (?,?)", (cp, pn))
                                 conn.commit()
@@ -309,36 +437,35 @@ elif choice == "Upload Reports":
                     if st.button("🚀 Push to Dashboard", type="primary"):
                         try:
                             inserted = 0
-                            duplicates = 0
                             
                             for _, row in df.iterrows():
                                 targets = mappings.get(row['campaign'], ["Unmapped"])
                                 n = len(targets)
                                 
                                 for p_name in targets:
-                                    try:
-                                        # Use INSERT OR REPLACE to handle duplicates
-                                        c.execute("""
-                                            INSERT OR REPLACE INTO performance 
-                                            (date, channel, campaign, product, spend, sales, clicks, orders) 
-                                            VALUES (?,?,?,?,?,?,?,?)
-                                        """, (row['date'], sel_ch, row['campaign'], p_name, 
-                                             row['spend']/n, row['sales']/n, 0, 0))
-                                        inserted += 1
-                                    except sqlite3.IntegrityError:
-                                        duplicates += 1
+                                    c.execute("""
+                                        INSERT OR REPLACE INTO performance 
+                                        (date, channel, campaign, product, spend, sales, clicks, orders) 
+                                        VALUES (?,?,?,?,?,?,?,?)
+                                    """, (row['date'], sel_ch, row['campaign'], p_name, 
+                                         row['spend']/n, row['sales']/n, 0, 0))
+                                    inserted += 1
                             
                             conn.commit()
-                            st.success(f"✅ Pushed {inserted} records to dashboard!")
-                            if duplicates > 0:
-                                st.info(f"ℹ️ {duplicates} duplicate records updated")
+                            st.success(f"✅ Successfully pushed {inserted} records to dashboard!")
+                            
+                            # Auto-create backup after successful upload
+                            with st.spinner("Creating automatic backup..."):
+                                create_backup()
+                                st.info("💾 Automatic backup created")
+                            
                         except Exception as e:
                             st.error(f"Error: {str(e)}")
                             conn.rollback()
             else:
                 st.error("❌ Could not process file")
 
-# --- 6. DATA HISTORY ---
+# --- 8. DATA HISTORY ---
 elif choice == "Data History":
     st.header("📚 Data Upload History")
     
@@ -383,7 +510,7 @@ elif choice == "Data History":
             hide_index=True
         )
 
-# --- 7. DASHBOARD ---
+# --- 9. DASHBOARD ---
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
     
@@ -657,14 +784,21 @@ elif choice == "Dashboard":
 
 # Footer
 st.sidebar.divider()
-st.sidebar.caption(f"Logged in as: **{st.session_state.role}**")
+st.sidebar.caption(f"👤 Logged in as: **{st.session_state.role}**")
 if st.sidebar.button("🚪 Logout"):
     st.session_state.auth = False
     st.rerun()
 
 # Database info
 st.sidebar.divider()
-st.sidebar.caption(f"Database: {DB_PATH}")
-if os.path.exists(DB_PATH):
-    db_size = os.path.getsize(DB_PATH) / 1024  # KB
-    st.sidebar.caption(f"Size: {db_size:.2f} KB")
+st.sidebar.caption(f"💾 Database: `{st.session_state.db_path}`")
+if os.path.exists(st.session_state.db_path):
+    db_size = os.path.getsize(st.session_state.db_path) / 1024  # KB
+    st.sidebar.caption(f"📊 Size: {db_size:.2f} KB")
+    
+    # Show record counts
+    try:
+        perf_count = c.execute("SELECT COUNT(*) FROM performance").fetchone()[0]
+        st.sidebar.caption(f"📈 Records: {perf_count:,}")
+    except:
+        pass
