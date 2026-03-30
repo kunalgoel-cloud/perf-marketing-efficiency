@@ -6,12 +6,10 @@ from datetime import datetime
 from supabase import create_client, Client
 import json
 
-# --- 1. SUPABASE CONFIGURATION ---
-# Store these in Streamlit secrets (.streamlit/secrets.toml)
-# For local development, create .streamlit/secrets.toml with:
-# SUPABASE_URL = "your-project-url"
-# SUPABASE_KEY = "your-anon-key"
+# Page config - MUST be first Streamlit command
+st.set_page_config(page_title="Marketing Dashboard", page_icon="📊", layout="wide")
 
+# --- 1. SUPABASE CONFIGURATION ---
 def get_supabase_client() -> Client:
     """Initialize Supabase client"""
     try:
@@ -33,7 +31,6 @@ supabase = st.session_state.supabase
 def init_supabase_tables():
     """Check if tables exist and provide setup instructions"""
     try:
-        # Test connection by trying to read from products table
         supabase.table('products').select("*").limit(1).execute()
         return True
     except Exception as e:
@@ -82,33 +79,31 @@ CREATE TABLE IF NOT EXISTS performance (
     CONSTRAINT performance_unique UNIQUE(date, channel, campaign, product)
 );
 
--- Create indexes for better performance
+-- Create indexes
 CREATE INDEX IF NOT EXISTS idx_performance_date ON performance(date);
 CREATE INDEX IF NOT EXISTS idx_performance_channel ON performance(channel);
 CREATE INDEX IF NOT EXISTS idx_performance_product ON performance(product);
 CREATE INDEX IF NOT EXISTS idx_performance_composite ON performance(date, channel, product);
 
--- Enable Row Level Security (RLS) - Optional but recommended
+-- Enable RLS
 ALTER TABLE products ENABLE ROW LEVEL SECURITY;
 ALTER TABLE channels ENABLE ROW LEVEL SECURITY;
 ALTER TABLE mappings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE performance ENABLE ROW LEVEL SECURITY;
 
--- Create policies to allow all operations (adjust based on your security needs)
+-- Create policies
 CREATE POLICY "Enable all for products" ON products FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Enable all for channels" ON channels FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Enable all for mappings" ON mappings FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Enable all for performance" ON performance FOR ALL USING (true) WITH CHECK (true);
             """, language="sql")
-        
         st.stop()
 
-# Initialize tables
 init_supabase_tables()
 
 # --- 3. DATA PROCESSING ENGINE ---
 def robust_read_file(file):
-    """Read CSV or Excel files with multiple encoding attempts"""
+    """Read CSV or Excel files"""
     file_name = file.name.lower()
     if file_name.endswith(('.xlsx', '.xls')):
         try:
@@ -161,18 +156,20 @@ def standardize_data(df, manual_date=None):
     return df[['date', 'campaign', 'spend', 'sales']]
 
 # --- 4. SUPABASE CRUD OPERATIONS ---
+@st.cache_data(ttl=60)  # Cache for 60 seconds
 def get_all_products():
     """Get all products from Supabase"""
     try:
-        response = supabase.table('products').select('name').order('name').execute()
+        response = st.session_state.supabase.table('products').select('name').order('name').execute()
         return [item['name'] for item in response.data]
     except:
         return []
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds
 def get_all_channels():
     """Get all channels from Supabase"""
     try:
-        response = supabase.table('channels').select('name').order('name').execute()
+        response = st.session_state.supabase.table('channels').select('name').order('name').execute()
         return [item['name'] for item in response.data]
     except:
         return []
@@ -181,6 +178,8 @@ def add_product(name):
     """Add a new product"""
     try:
         supabase.table('products').insert({'name': name}).execute()
+        # Clear cache after adding
+        get_all_products.clear()
         return True
     except Exception as e:
         st.error(f"Error adding product: {str(e)}")
@@ -190,15 +189,18 @@ def add_channel(name):
     """Add a new channel"""
     try:
         supabase.table('channels').insert({'name': name}).execute()
+        # Clear cache after adding
+        get_all_channels.clear()
         return True
     except Exception as e:
         st.error(f"Error adding channel: {str(e)}")
         return False
 
+@st.cache_data(ttl=60)  # Cache for 60 seconds
 def get_all_mappings():
     """Get all campaign-product mappings"""
     try:
-        response = supabase.table('mappings').select('campaign, product_name').order('campaign').execute()
+        response = st.session_state.supabase.table('mappings').select('campaign, product_name').order('campaign').execute()
         return pd.DataFrame(response.data)
     except:
         return pd.DataFrame(columns=['campaign', 'product_name'])
@@ -210,6 +212,8 @@ def add_mapping(campaign, product_name):
             'campaign': campaign,
             'product_name': product_name
         }).execute()
+        # Clear cache after adding
+        get_all_mappings.clear()
         return True
     except:
         return False
@@ -218,21 +222,24 @@ def delete_mapping(campaign, product_name):
     """Delete a mapping"""
     try:
         supabase.table('mappings').delete().eq('campaign', campaign).eq('product_name', product_name).execute()
+        # Clear cache after deleting
+        get_all_mappings.clear()
         return True
     except Exception as e:
         st.error(f"Error deleting mapping: {str(e)}")
         return False
 
-def get_all_performance():
-    """Get all performance data"""
+@st.cache_data(ttl=10)  # Cache for only 10 seconds - refresh frequently
+def get_all_performance(_timestamp=None):
+    """Get all performance data - timestamp param forces cache refresh"""
     try:
-        response = supabase.table('performance').select('*').execute()
+        response = st.session_state.supabase.table('performance').select('*').execute()
         return pd.DataFrame(response.data)
     except:
         return pd.DataFrame()
 
 def add_performance_record(date, channel, campaign, product, spend, sales):
-    """Add or update performance record using upsert"""
+    """Add or update performance record"""
     try:
         record = {
             'date': date,
@@ -245,38 +252,39 @@ def add_performance_record(date, channel, campaign, product, spend, sales):
             'orders': 0
         }
         
-        # Use upsert to insert or update based on unique constraint
-        # onConflict parameter tells Supabase which columns form the unique constraint
         supabase.table('performance').upsert(
             record,
             on_conflict='date,channel,campaign,product'
         ).execute()
         
+        # Clear cache after adding/updating
+        get_all_performance.clear()
         return True
     except Exception as e:
-        # If upsert doesn't work, try manual check
         try:
-            # Check if record exists
             existing = supabase.table('performance').select('*').eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
             
             if existing.data and len(existing.data) > 0:
-                # Update existing record - use the unique fields to identify it
                 supabase.table('performance').update({
                     'spend': float(spend),
                     'sales': float(sales)
                 }).eq('date', date).eq('channel', channel).eq('campaign', campaign).eq('product', product).execute()
             else:
-                # Insert new record
                 supabase.table('performance').insert(record).execute()
+            
+            # Clear cache after operation
+            get_all_performance.clear()
             return True
         except Exception as e2:
             st.error(f"Error saving performance: {str(e2)}")
             return False
 
 def delete_performance_records(channel, date):
-    """Delete performance records for a channel and date"""
+    """Delete performance records"""
     try:
         result = supabase.table('performance').delete().eq('channel', channel).eq('date', date).execute()
+        # Clear cache after deleting
+        get_all_performance.clear()
         return len(result.data) if result.data else 0
     except Exception as e:
         st.error(f"Error deleting records: {str(e)}")
@@ -288,7 +296,7 @@ if 'auth' not in st.session_state:
 
 if not st.session_state.auth:
     st.title("🛡️ Secure Marketing Portal")
-    st.info("💡 Login to access the dashboard. Default credentials: admin/admin123 or viewer/view123")
+    st.info("💡 Login credentials: admin/admin123 or viewer/view123")
     
     col1, col2 = st.columns(2)
     with col1:
@@ -378,7 +386,7 @@ if choice == "Settings":
     
     with t3:
         st.subheader("🗑️ Delete Data")
-        st.warning("⚠️ Use with caution - this will permanently delete data!")
+        st.warning("⚠️ Use with caution!")
         
         d_col1, d_col2 = st.columns(2)
         with d_col1:
@@ -392,6 +400,10 @@ if choice == "Settings":
                 d_str = target_date.strftime('%Y-%m-%d')
                 deleted = delete_performance_records(target_ch, d_str)
                 st.warning(f"✅ Deleted {deleted} records for {target_ch} on {d_str}")
+                # Automatically refresh dashboard view
+                if deleted > 0:
+                    st.info("🔄 Dashboard will refresh automatically...")
+                    st.rerun()
             else:
                 st.error("Please select both channel and date")
 
@@ -399,7 +411,6 @@ if choice == "Settings":
 elif choice == "Upload Reports":
     st.header("📥 Data Ingestion")
     
-    # Check if we have master data
     channels = get_all_channels()
     products = get_all_products()
     
@@ -427,7 +438,6 @@ elif choice == "Upload Reports":
                 st.success(f"✅ Processed {len(df)} rows")
                 st.dataframe(df.head(10), use_container_width=True)
                 
-                # Get existing mappings
                 df_map = get_all_mappings()
                 mappings = {}
                 if not df_map.empty:
@@ -479,9 +489,21 @@ elif choice == "Upload Reports":
                                     else:
                                         errors += 1
                             
-                            st.success(f"✅ Successfully pushed {inserted} records to Supabase!")
-                            if errors > 0:
-                                st.warning(f"⚠️ {errors} records had errors")
+                            if inserted > 0:
+                                st.success(f"✅ Successfully pushed {inserted} records!")
+                                if errors > 0:
+                                    st.warning(f"⚠️ {errors} records had errors")
+                                
+                                st.info("🔄 Redirecting to Dashboard...")
+                                # Store flag to show success message on dashboard
+                                st.session_state.upload_success = True
+                                st.session_state.uploaded_records = inserted
+                                # Wait a moment then redirect
+                                import time
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error("❌ No records were uploaded")
             else:
                 st.error("❌ Could not process file")
 
@@ -489,16 +511,15 @@ elif choice == "Upload Reports":
 elif choice == "Data History":
     st.header("📚 Data Upload History")
     
-    df_p = get_all_performance()
+    # Force fresh data fetch with timestamp
+    df_p = get_all_performance(_timestamp=datetime.now().timestamp())
     
     if df_p.empty:
         st.info("No data uploaded yet")
     else:
-        # Drop id and created_at columns if they exist
         df_p = df_p.drop(columns=['id', 'created_at'], errors='ignore')
         df_p['date'] = pd.to_datetime(df_p['date'])
         
-        # Summary statistics
         st.subheader("📊 Data Summary")
         col1, col2, col3, col4 = st.columns(4)
         
@@ -513,7 +534,6 @@ elif choice == "Data History":
         
         st.divider()
         
-        # Upload history by date and channel
         st.subheader("Upload History")
         history = df_p.groupby(['date', 'channel']).agg({
             'campaign': 'count',
@@ -536,22 +556,40 @@ elif choice == "Data History":
 elif choice == "Dashboard":
     st.header("📊 Performance Dashboard")
     
-    df_p = get_all_performance()
+    # Show upload success message if coming from upload
+    if 'upload_success' in st.session_state and st.session_state.upload_success:
+        st.success(f"🎉 Successfully uploaded {st.session_state.uploaded_records} records! Dashboard updated.")
+        # Clear the flag
+        del st.session_state.upload_success
+        del st.session_state.uploaded_records
+    
+    # Force fresh data fetch with timestamp to bypass cache
+    df_p = get_all_performance(_timestamp=datetime.now().timestamp())
     
     if df_p.empty: 
         st.info("📭 No data available. Please upload data using 'Upload Reports'.")
         st.stop()
     
-    # Drop id and created_at columns
     df_p = df_p.drop(columns=['id', 'created_at'], errors='ignore')
     df_p['date'] = pd.to_datetime(df_p['date'])
     
     # Sidebar Filters
     st.sidebar.subheader("🎯 Filters")
     
+    # Add refresh button
+    if st.sidebar.button("🔄 Refresh Data"):
+        get_all_performance.clear()
+        st.rerun()
+    
+    st.sidebar.divider()
+    
     # Date range filter
     min_date = df_p['date'].min().date()
     max_date = df_p['date'].max().date()
+    
+    # Show current date range
+    st.sidebar.caption(f"Available dates: {min_date} to {max_date}")
+    
     dr = st.sidebar.date_input(
         "Date Range", 
         value=(min_date, max_date),
@@ -753,7 +791,6 @@ elif choice == "Dashboard":
     col_d1, col_d2, col_d3 = st.columns(3)
     
     with col_d1:
-        # Convert to CSV for download
         csv_data = detail_tab.to_csv(index=False)
         st.download_button(
             label="📥 Download as CSV",
@@ -764,12 +801,10 @@ elif choice == "Dashboard":
         )
     
     with col_d2:
-        # Convert to Excel for download
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             detail_tab.to_excel(writer, index=False, sheet_name='Performance Data')
             
-            # Add summary sheet
             summary_data = pd.DataFrame({
                 'Metric': ['Total Spend', 'Total Revenue', 'Overall ROAS', 'Date Range', 'Total Records'],
                 'Value': [
@@ -792,7 +827,6 @@ elif choice == "Dashboard":
         )
     
     with col_d3:
-        # Download aggregated summary
         summary_csv = pd.concat([
             channel_summary.reset_index().assign(Group='Channel'),
             product_summary.reset_index().assign(Group='Product')
@@ -817,7 +851,9 @@ if st.sidebar.button("🚪 Logout"):
 st.sidebar.divider()
 st.sidebar.success("☁️ Connected to Supabase")
 try:
-    perf_count = len(get_all_performance())
+    # Force fresh count
+    perf_count = len(get_all_performance(_timestamp=datetime.now().timestamp()))
     st.sidebar.caption(f"📈 Total Records: {perf_count:,}")
+    st.sidebar.caption(f"🕐 Last updated: {datetime.now().strftime('%H:%M:%S')}")
 except:
     pass
